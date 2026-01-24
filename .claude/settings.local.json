@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:pypi.org)",
+      "WebSearch",
+      "WebFetch(domain:flet.dev)",
+      "WebFetch(domain:docs.flet.dev)",
+      "WebFetch(domain:github.com)",
+      "Bash(dir:*)",
+      "Bash(del /f \"d:\\\\Projects\\\\Python Scripts\\\\Movie Picker\\\\movie_picker\\\\movie_picker.db\")",
+      "Bash(pipenv run python:*)",
+      "WebFetch(domain:api.themoviedb.org)"
+    ]
+  }
+}
