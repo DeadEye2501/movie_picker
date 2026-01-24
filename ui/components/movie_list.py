@@ -16,6 +16,7 @@ class MovieList(ft.Container):
         on_rating_change: Optional[Callable[[Movie, int], None]] = None,
         on_review_click: Optional[Callable[[Movie], None]] = None,
         on_similar_click: Optional[Callable[[Movie], None]] = None,
+        on_rating_delete: Optional[Callable[[Movie], None]] = None,
     ):
         self.movies: list[Movie] = []
         self.ratings: dict[int, UserRating] = {}
@@ -23,6 +24,7 @@ class MovieList(ft.Container):
         self.on_rating_change = on_rating_change
         self.on_review_click = on_review_click
         self.on_similar_click = on_similar_click
+        self.on_rating_delete = on_rating_delete
         self.message: Optional[str] = None
         self.is_loading = False
 
@@ -113,6 +115,25 @@ class MovieList(ft.Container):
         self.ratings[movie_id] = rating
         self._refresh()
 
+    def remove_rating(self, movie_id: int, remove_from_list: bool = False):
+        """Remove rating for a specific movie.
+
+        Args:
+            movie_id: ID of the movie
+            remove_from_list: If True, also remove movie from the list (for ratings view)
+        """
+        if movie_id in self.ratings:
+            del self.ratings[movie_id]
+
+        if remove_from_list:
+            self.movies = [m for m in self.movies if m.id != movie_id]
+            # Adjust current page if needed
+            total_pages = max(1, (len(self.movies) + self.ITEMS_PER_PAGE - 1) // self.ITEMS_PER_PAGE)
+            if self.current_page >= total_pages:
+                self.current_page = max(0, total_pages - 1)
+
+        self._refresh()
+
     def _refresh(self):
         """Refresh the displayed content."""
         self.loading_indicator.visible = False
@@ -149,6 +170,7 @@ class MovieList(ft.Container):
                     on_rating_change=self.on_rating_change,
                     on_review_click=self.on_review_click,
                     on_similar_click=self.on_similar_click,
+                    on_rating_delete=self.on_rating_delete,
                 )
                 self.movies_column.controls.append(card)
 

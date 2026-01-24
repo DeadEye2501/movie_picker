@@ -1,4 +1,5 @@
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 
 
@@ -56,6 +57,11 @@ class TMDBAPI:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        # Reuse HTTP client for connection pooling
+        self._client = httpx.Client(
+            timeout=15.0,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
 
     def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
         """Make a GET request to the API."""
@@ -65,13 +71,12 @@ class TMDBAPI:
             params["api_key"] = self.api_key
             params["language"] = "ru-RU"
 
-            with httpx.Client(timeout=30.0) as client:
-                response = client.get(
-                    f"{self.BASE_URL}{endpoint}",
-                    params=params,
-                )
-                response.raise_for_status()
-                return response.json()
+            response = self._client.get(
+                f"{self.BASE_URL}{endpoint}",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
         except Exception:
             return None
 
@@ -140,12 +145,22 @@ class TMDBAPI:
         return self._parse_credits(data)
 
     def get_full_movie_info(self, movie_id: int) -> Optional[dict]:
-        """Get complete movie information including credits."""
-        details = self.get_movie_details(movie_id)
-        if details is None:
+        """Get complete movie information including credits in ONE request."""
+        # Combine details + credits + external_ids in single API call
+        data = self._get(f"/movie/{movie_id}", {"append_to_response": "credits,external_ids"})
+
+        if not data:
             return None
 
-        credits = self.get_movie_credits(movie_id)
+        # Parse IMDB ID
+        external_ids = data.get("external_ids", {})
+        data["imdb_id"] = external_ids.get("imdb_id") or data.get("imdb_id")
+
+        details = self._parse_movie_details(data)
+
+        # Parse credits from same response
+        credits_data = data.get("credits", {})
+        credits = self._parse_credits(credits_data)
         details["director"] = credits["director"]
         details["actors"] = ", ".join(credits["actors"][:10])
 
@@ -184,12 +199,22 @@ class TMDBAPI:
         return self._parse_tv_credits(data)
 
     def get_full_tv_info(self, tv_id: int) -> Optional[dict]:
-        """Get complete TV show information including credits."""
-        details = self.get_tv_details(tv_id)
-        if details is None:
+        """Get complete TV show information including credits in ONE request."""
+        # Combine details + credits + external_ids in single API call
+        data = self._get(f"/tv/{tv_id}", {"append_to_response": "credits,external_ids"})
+
+        if not data:
             return None
 
-        credits = self.get_tv_credits(tv_id)
+        # Parse IMDB ID
+        external_ids = data.get("external_ids", {})
+        data["imdb_id"] = external_ids.get("imdb_id")
+
+        details = self._parse_tv_details(data)
+
+        # Parse credits from same response
+        credits_data = data.get("credits", {})
+        credits = self._parse_tv_credits(credits_data)
         details["director"] = credits["director"]
         details["actors"] = ", ".join(credits["actors"][:10])
 
@@ -371,6 +396,7 @@ class TMDBAPI:
     def search_by_keyword(self, keyword: str, page: int = 1) -> list[dict]:
         """
         Simple search: movies AND TV shows by title, person name, genre.
+        Uses parallel requests for speed.
         """
         seen_movie_ids = set()
         seen_tv_ids = set()
@@ -378,52 +404,78 @@ class TMDBAPI:
 
         keyword_lower = keyword.lower()
 
-        # 1. Check if keyword is a genre
+        # Prepare tasks for parallel execution
+        tasks = []
+
+        # 1. Genre searches
         movie_genre_id = self.MOVIE_GENRES.get(keyword_lower)
         if movie_genre_id:
-            for movie in self.discover_by_genre([movie_genre_id], page):
-                tmdb_id = movie.get("kinopoisk_id")
-                if tmdb_id and tmdb_id not in seen_movie_ids:
-                    seen_movie_ids.add(tmdb_id)
-                    results.append(movie)
+            tasks.append(("discover_movie", [movie_genre_id], page))
 
         tv_genre_id = self.TV_GENRES.get(keyword_lower)
         if tv_genre_id:
-            for tv in self.discover_tv_by_genre([tv_genre_id], page):
-                tmdb_id = tv.get("kinopoisk_id")
-                if tmdb_id and tmdb_id not in seen_tv_ids:
-                    seen_tv_ids.add(tmdb_id)
-                    results.append(tv)
+            tasks.append(("discover_tv", [tv_genre_id], page))
 
-        # 2. Search movies by title
-        for movie in self.search_movies(keyword, page):
-            tmdb_id = movie.get("kinopoisk_id")
-            if tmdb_id and tmdb_id not in seen_movie_ids:
-                seen_movie_ids.add(tmdb_id)
-                results.append(movie)
+        # 2. Title searches
+        tasks.append(("search_movie", keyword, page))
+        tasks.append(("search_tv", keyword, page))
 
-        # 3. Search TV shows by title
-        for tv in self.search_tv(keyword, page):
-            tmdb_id = tv.get("kinopoisk_id")
-            if tmdb_id and tmdb_id not in seen_tv_ids:
-                seen_tv_ids.add(tmdb_id)
-                results.append(tv)
+        # 3. Person search
+        tasks.append(("search_person", keyword, None))
 
-        # 4. Search person
-        for person in self.search_person(keyword)[:3]:
-            person_id = person.get("id")
-            if person_id:
-                for movie in self.get_person_movies(person_id)[:15]:
-                    tmdb_id = movie.get("kinopoisk_id")
-                    if tmdb_id and tmdb_id not in seen_movie_ids:
-                        seen_movie_ids.add(tmdb_id)
-                        results.append(movie)
+        # Execute all tasks in parallel
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            for task in tasks:
+                if task[0] == "discover_movie":
+                    futures[executor.submit(self.discover_by_genre, task[1], task[2])] = task
+                elif task[0] == "discover_tv":
+                    futures[executor.submit(self.discover_tv_by_genre, task[1], task[2])] = task
+                elif task[0] == "search_movie":
+                    futures[executor.submit(self.search_movies, task[1], task[2])] = task
+                elif task[0] == "search_tv":
+                    futures[executor.submit(self.search_tv, task[1], task[2])] = task
+                elif task[0] == "search_person":
+                    futures[executor.submit(self.search_person, task[1])] = task
 
-                for tv in self.get_person_tv(person_id)[:15]:
-                    tmdb_id = tv.get("kinopoisk_id")
-                    if tmdb_id and tmdb_id not in seen_tv_ids:
-                        seen_tv_ids.add(tmdb_id)
-                        results.append(tv)
+            person_ids = []
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    items = future.result()
+                    if task[0] == "search_person":
+                        person_ids = [p.get("id") for p in items[:2] if p.get("id")]
+                    else:
+                        is_tv = task[0] in ("discover_tv", "search_tv")
+                        target_set = seen_tv_ids if is_tv else seen_movie_ids
+                        for item in items:
+                            tmdb_id = item.get("kinopoisk_id")
+                            if tmdb_id and tmdb_id not in target_set:
+                                target_set.add(tmdb_id)
+                                results.append(item)
+                except Exception:
+                    pass
+
+            # Fetch person filmographies in parallel
+            if person_ids:
+                person_futures = {}
+                for pid in person_ids:
+                    person_futures[executor.submit(self.get_person_movies, pid)] = ("movie", pid)
+                    person_futures[executor.submit(self.get_person_tv, pid)] = ("tv", pid)
+
+                for future in as_completed(person_futures):
+                    task_type, _ = person_futures[future]
+                    try:
+                        items = future.result()[:10]
+                        is_tv = task_type == "tv"
+                        target_set = seen_tv_ids if is_tv else seen_movie_ids
+                        for item in items:
+                            tmdb_id = item.get("kinopoisk_id")
+                            if tmdb_id and tmdb_id not in target_set:
+                                target_set.add(tmdb_id)
+                                results.append(item)
+                    except Exception:
+                        pass
 
         return results
 

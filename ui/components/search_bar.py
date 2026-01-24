@@ -36,10 +36,12 @@ class SearchBar(ft.Container):
         on_search: Optional[Callable[[str, list[int]], None]] = None,
         on_my_ratings: Optional[Callable[[], None]] = None,
         on_magic: Optional[Callable[[], None]] = None,
+        on_genre_change: Optional[Callable[[], None]] = None,
     ):
         self.on_search = on_search
         self.on_my_ratings = on_my_ratings
         self.on_magic = on_magic
+        self.on_genre_change = on_genre_change
         self.selected_genres: list[int] = []
 
         self.clear_icon = ft.Container(
@@ -88,6 +90,10 @@ class SearchBar(ft.Container):
             overflow=ft.TextOverflow.ELLIPSIS,
         )
 
+        # Ratings button (becomes sort button in ratings mode)
+        self.ratings_button = None  # Will be built in _build_ratings_button
+        self.ratings_icon_container = None
+
         super().__init__(
             content=self._build_content(),
             margin=ft.margin.only(bottom=8),
@@ -120,16 +126,7 @@ class SearchBar(ft.Container):
                             width=36,
                             height=36,
                         ),
-                        ft.IconButton(
-                            icon=ft.Icons.STAR,
-                            icon_size=20,
-                            icon_color=COLORS["text_primary"],
-                            bgcolor=COLORS["surface_variant"],
-                            on_click=lambda e: self._handle_my_ratings(),
-                            tooltip="Мои оценки",
-                            width=36,
-                            height=36,
-                        ),
+                        self._build_ratings_button(),
                     ],
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -164,6 +161,8 @@ class SearchBar(ft.Container):
             self.genre_button.icon_color = COLORS["primary"] if self.selected_genres else COLORS["text_primary"]
             dialog.open = False
             self.page.update()
+            if self.on_genre_change:
+                self.on_genre_change()
 
         def clear_selection(e):
             for cb in checkboxes:
@@ -173,6 +172,8 @@ class SearchBar(ft.Container):
             self.genre_button.icon_color = COLORS["text_primary"]
             dialog.open = False
             self.page.update()
+            if self.on_genre_change:
+                self.on_genre_change()
 
         dialog = ft.AlertDialog(
             title=ft.Text("Выберите жанры", size=16),
@@ -242,6 +243,47 @@ class SearchBar(ft.Container):
 
     def get_selected_genres(self) -> list[int]:
         return self.selected_genres
+
+    def get_selected_genre_names(self) -> list[str]:
+        """Get selected genre names (for filtering rated movies)."""
+        return [name for name, gid in GENRES if gid in self.selected_genres]
+
+    def _build_ratings_button(self) -> ft.Container:
+        """Build the ratings/sort button."""
+        self.ratings_icon_container = ft.Row(
+            controls=[ft.Icon(ft.Icons.STAR, size=20, color=COLORS["text_primary"])],
+            alignment=ft.MainAxisAlignment.CENTER,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=0,
+        )
+        self.ratings_button = ft.Container(
+            content=self.ratings_icon_container,
+            width=36,
+            height=36,
+            border_radius=18,
+            bgcolor=COLORS["surface_variant"],
+            on_click=lambda e: self._handle_my_ratings(),
+            tooltip="Мои оценки",
+            alignment=ft.Alignment(0, 0),
+        )
+        return self.ratings_button
+
+    def set_ratings_button_icons(self, main_icon, arrow_icon):
+        """Set icons for ratings button (sort mode)."""
+        self.ratings_icon_container.controls = [
+            ft.Icon(main_icon, size=16, color=COLORS["primary"]),
+            ft.Icon(arrow_icon, size=14, color=COLORS["primary"]),
+        ]
+        self.ratings_button.tooltip = "Сортировка"
+        self.ratings_icon_container.update()
+
+    def reset_ratings_button(self):
+        """Reset ratings button to default state."""
+        self.ratings_icon_container.controls = [
+            ft.Icon(ft.Icons.STAR, size=20, color=COLORS["text_primary"])
+        ]
+        self.ratings_button.tooltip = "Мои оценки"
+        self.ratings_icon_container.update()
 
     def clear(self):
         self.search_field.value = ""

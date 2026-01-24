@@ -9,6 +9,7 @@ class OMDBAPI:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self._client = httpx.Client(timeout=10.0)
 
     def get_ratings_by_imdb_id(self, imdb_id: str) -> dict:
         """Get ratings from OMDB by IMDB ID."""
@@ -16,18 +17,17 @@ class OMDBAPI:
             return {}
 
         try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.get(
-                    self.BASE_URL,
-                    params={"i": imdb_id, "apikey": self.api_key},
-                )
-                response.raise_for_status()
-                data = response.json()
+            response = self._client.get(
+                self.BASE_URL,
+                params={"i": imdb_id, "apikey": self.api_key},
+            )
+            response.raise_for_status()
+            data = response.json()
 
-                if data.get("Response") == "False":
-                    return {}
+            if data.get("Response") == "False":
+                return {}
 
-                return self._parse_ratings(data)
+            return self._parse_ratings(data)
         except Exception:
             return {}
 

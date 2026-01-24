@@ -16,6 +16,7 @@ class MovieCard(ft.Container):
         on_rating_change: Optional[Callable[[Movie, int], None]] = None,
         on_review_click: Optional[Callable[[Movie], None]] = None,
         on_similar_click: Optional[Callable[[Movie], None]] = None,
+        on_rating_delete: Optional[Callable[[Movie], None]] = None,
     ):
         self.movie = movie
         self.user_rating = user_rating
@@ -23,6 +24,7 @@ class MovieCard(ft.Container):
         self.on_rating_change = on_rating_change
         self.on_review_click = on_review_click
         self.on_similar_click = on_similar_click
+        self.on_rating_delete = on_rating_delete
         self.description_expanded = False
 
         super().__init__(
@@ -184,16 +186,25 @@ class MovieCard(ft.Container):
         if not ratings_parts:
             ratings_parts.append(ft.Text("Нет оценок", size=12, color=COLORS["text_secondary"]))
 
+        # Build user rating row with optional label
+        user_rating_controls = [
+            ft.Text("Моя оценка:", size=13, color=COLORS["text_secondary"]),
+            *self._build_star_rating(),
+        ]
+        if self.user_rating is not None:
+            user_rating_controls.append(
+                ft.Text(
+                    self._get_rating_label(self.user_rating),
+                    size=13,
+                    weight=ft.FontWeight.BOLD,
+                    color=self._get_star_color(self.user_rating),
+                )
+            )
+
         return ft.Column(
             controls=[
                 ft.Row(controls=ratings_parts, spacing=0),
-                ft.Row(
-                    controls=[
-                        ft.Text("Моя оценка:", size=13, color=COLORS["text_secondary"]),
-                        *self._build_star_rating(),
-                    ],
-                    spacing=4,
-                ),
+                ft.Row(controls=user_rating_controls, spacing=4),
             ],
             spacing=6,
         )
@@ -214,9 +225,38 @@ class MovieCard(ft.Container):
         }
         return colors.get(rating, COLORS["primary"])
 
+    def _get_rating_label(self, rating: int) -> str:
+        """Get text label for rating value."""
+        labels = {
+            1: "Отвратительно",
+            2: "Плохо",
+            3: "Уныло",
+            4: "Посредственно",
+            5: "Средне",
+            6: "Неплохо",
+            7: "Интересно",
+            8: "Хорошо",
+            9: "Отлично",
+            10: "Шедевр",
+        }
+        return labels.get(rating, "")
+
     def _build_star_rating(self) -> list[ft.Control]:
         stars = []
         star_color = self._get_star_color(self.user_rating) if self.user_rating else COLORS["star_empty"]
+
+        rating_labels = {
+            1: "1 — Отвратительно",
+            2: "2 — Плохо",
+            3: "3 — Уныло",
+            4: "4 — Посредственно",
+            5: "5 — Средне",
+            6: "6 — Неплохо",
+            7: "7 — Интересно",
+            8: "8 — Хорошо",
+            9: "9 — Отлично",
+            10: "10 — Шедевр",
+        }
 
         for i in range(1, 11):
             is_filled = self.user_rating is not None and i <= self.user_rating
@@ -225,12 +265,27 @@ class MovieCard(ft.Container):
                 icon_size=18,
                 icon_color=star_color if is_filled else COLORS["star_empty"],
                 on_click=lambda e, rating=i: self._handle_rating_click(rating),
-                tooltip=str(i),
+                tooltip=rating_labels[i],
                 padding=0,
                 width=24,
                 height=24,
             )
             stars.append(star)
+
+        # Add delete button if there's a rating
+        if self.user_rating is not None:
+            delete_button = ft.IconButton(
+                icon=ft.Icons.DELETE_OUTLINE,
+                icon_size=18,
+                icon_color=COLORS["text_secondary"],
+                on_click=lambda e: self._handle_rating_delete(),
+                tooltip="Удалить оценку",
+                padding=0,
+                width=24,
+                height=24,
+            )
+            stars.append(delete_button)
+
         return stars
 
     def _build_actions_row(self) -> ft.Control:
@@ -256,6 +311,10 @@ class MovieCard(ft.Container):
     def _handle_rating_click(self, rating: int):
         if self.on_rating_change:
             self.on_rating_change(self.movie, rating)
+
+    def _handle_rating_delete(self):
+        if self.on_rating_delete:
+            self.on_rating_delete(self.movie)
 
     def _handle_review_click(self):
         if self.on_review_click:

@@ -5,72 +5,74 @@ from database.models import Movie
 from ui.theme import COLORS
 
 
-class RatingDialog(ft.AlertDialog):
-    """Dialog for viewing and editing movie reviews."""
+def show_rating_dialog(
+    page: ft.Page,
+    movie: Movie,
+    current_review: Optional[str] = None,
+    on_save: Optional[Callable[[Movie, str], None]] = None,
+):
+    """Show a dialog for editing movie review."""
 
-    def __init__(
-        self,
-        movie: Movie,
-        current_review: Optional[str] = None,
-        on_save: Optional[Callable[[Movie, str], None]] = None,
-        on_close: Optional[Callable[[], None]] = None,
-    ):
-        self.movie = movie
-        self.on_save = on_save
-        self.on_close = on_close
+    review_field = ft.TextField(
+        value=current_review or "",
+        multiline=True,
+        min_lines=5,
+        max_lines=10,
+        hint_text="Напишите вашу рецензию...",
+        bgcolor=COLORS["surface_variant"],
+        border_color=COLORS["divider"],
+        focused_border_color=COLORS["primary"],
+        color=COLORS["text_primary"],
+        hint_style=ft.TextStyle(color=COLORS["text_secondary"]),
+        cursor_color=COLORS["primary"],
+        expand=True,
+    )
 
-        self.review_field = ft.TextField(
-            value=current_review or "",
-            multiline=True,
-            min_lines=5,
-            max_lines=10,
-            hint_text="Напишите вашу рецензию...",
-            bgcolor=COLORS["surface_variant"],
-            border_color=COLORS["divider"],
-            focused_border_color=COLORS["primary"],
+    def close_dialog(e=None):
+        dialog.open = False
+        page.update()
+
+    def save_and_close(e):
+        if on_save:
+            on_save(movie, review_field.value)
+        close_dialog()
+
+    dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text(
+            f"Рецензия: {movie.title}",
+            size=18,
+            weight=ft.FontWeight.BOLD,
             color=COLORS["text_primary"],
-            hint_style=ft.TextStyle(color=COLORS["text_secondary"]),
-            cursor_color=COLORS["primary"],
-            expand=True,
-        )
-
-        super().__init__(
-            modal=True,
-            title=ft.Text(
-                f"Рецензия: {movie.title}",
-                size=18,
-                weight=ft.FontWeight.BOLD,
-                color=COLORS["text_primary"],
+        ),
+        content=ft.Container(
+            content=review_field,
+            width=500,
+            height=200,
+        ),
+        actions=[
+            ft.TextButton(
+                "Отмена",
+                on_click=close_dialog,
+                style=ft.ButtonStyle(color=COLORS["text_secondary"]),
             ),
-            content=ft.Container(
-                content=self.review_field,
-                width=500,
-                height=200,
+            ft.ElevatedButton(
+                "Сохранить",
+                on_click=save_and_close,
+                bgcolor=COLORS["primary"],
+                color=COLORS["background"],
             ),
-            actions=[
-                ft.TextButton(
-                    "Отмена",
-                    on_click=lambda e: self._close(),
-                    style=ft.ButtonStyle(color=COLORS["text_secondary"]),
-                ),
-                ft.ElevatedButton(
-                    "Сохранить",
-                    on_click=lambda e: self._save(),
-                    bgcolor=COLORS["primary"],
-                    color=COLORS["background"],
-                ),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-            bgcolor=COLORS["surface"],
-        )
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+        bgcolor=COLORS["surface"],
+    )
 
-    def _save(self):
-        if self.on_save:
-            self.on_save(self.movie, self.review_field.value)
-        self._close()
+    page.overlay.append(dialog)
+    dialog.open = True
+    page.update()
 
-    def _close(self):
-        self.open = False
-        if self.on_close:
-            self.on_close()
-        self.update()
+
+# Keep class for backwards compatibility
+class RatingDialog(ft.AlertDialog):
+    """Deprecated. Use show_rating_dialog() instead."""
+    pass

@@ -58,21 +58,59 @@ class UserRating(Base):
         return f"<UserRating(movie_id={self.movie_id}, rating={self.rating})>"
 
 
-class EntityRating(Base):
-    """Stores aggregated ratings for entities (genres, directors, actors)."""
-    __tablename__ = "entity_ratings"
-    __table_args__ = (
-        UniqueConstraint('entity_type', 'entity_name', name='uq_entity_type_name'),
-    )
+class Genre(Base):
+    """Reference table for canonical genre names and aliases."""
+    __tablename__ = "genres"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    entity_type = Column(String(20), nullable=False, index=True)  # 'genre', 'director', 'actor'
-    entity_name = Column(String(500), nullable=False)
+    name = Column(String(100), nullable=False, unique=True)  # Canonical name: "боевик"
+    aliases = Column(String(500), nullable=True)  # Comma-separated: "action, экшен"
+    tmdb_movie_id = Column(Integer, nullable=True)  # TMDB movie genre ID
+    tmdb_tv_id = Column(Integer, nullable=True)  # TMDB TV genre ID
+
+    def __repr__(self):
+        return f"<Genre(name='{self.name}')>"
+
+
+class GenreRating(Base):
+    """Stores aggregated ratings for genres."""
+    __tablename__ = "genre_ratings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    genre_id = Column(Integer, ForeignKey("genres.id"), nullable=False, unique=True)
+    avg_rating = Column(Float, nullable=True)
+    count = Column(Integer, default=0)
+
+    genre = relationship("Genre")
+
+    def __repr__(self):
+        return f"<GenreRating(genre_id={self.genre_id}, avg={self.avg_rating}, count={self.count})>"
+
+
+class DirectorRating(Base):
+    """Stores aggregated ratings for directors."""
+    __tablename__ = "director_ratings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    director_name = Column(String(500), nullable=False, unique=True)
     avg_rating = Column(Float, nullable=True)
     count = Column(Integer, default=0)
 
     def __repr__(self):
-        return f"<EntityRating({self.entity_type}='{self.entity_name}', avg={self.avg_rating}, count={self.count})>"
+        return f"<DirectorRating(name='{self.director_name}', avg={self.avg_rating}, count={self.count})>"
+
+
+class ActorRating(Base):
+    """Stores aggregated ratings for actors."""
+    __tablename__ = "actor_ratings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    actor_name = Column(String(500), nullable=False, unique=True)
+    avg_rating = Column(Float, nullable=True)
+    count = Column(Integer, default=0)
+
+    def __repr__(self):
+        return f"<ActorRating(name='{self.actor_name}', avg={self.avg_rating}, count={self.count})>"
 
 
 class RecommendationCache(Base):

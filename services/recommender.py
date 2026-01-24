@@ -2,7 +2,10 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from database.models import Movie
-from database import get_all_user_ratings, get_entity_rating, get_cached_recommendations, save_cached_recommendations
+from database import (
+    get_all_user_ratings, get_genre_rating, get_director_rating, get_actor_rating,
+    get_cached_recommendations, save_cached_recommendations, normalize_genres
+)
 from api import TMDBAPI
 
 
@@ -33,19 +36,18 @@ class RecommenderService:
 
         # 2. Director rating
         if movie.director:
-            dir_rating = get_entity_rating(session, 'director', movie.director)
+            dir_rating = get_director_rating(session, movie.director)
             if dir_rating and dir_rating.avg_rating is not None:
                 score += self.WEIGHT_DIRECTOR * (dir_rating.avg_rating - 5)
 
-        # 3. Genres (average of all genres)
+        # 3. Genres (average of all known genres)
         if movie.genres:
+            genre_ids = normalize_genres(movie.genres, session)
             genre_scores = []
-            for genre in movie.genres.split(', '):
-                genre = genre.strip()
-                if genre:
-                    g_rating = get_entity_rating(session, 'genre', genre)
-                    if g_rating and g_rating.avg_rating is not None:
-                        genre_scores.append(g_rating.avg_rating)
+            for genre_id in genre_ids:
+                g_rating = get_genre_rating(session, genre_id)
+                if g_rating and g_rating.avg_rating is not None:
+                    genre_scores.append(g_rating.avg_rating)
             if genre_scores:
                 avg_genre = sum(genre_scores) / len(genre_scores)
                 score += self.WEIGHT_GENRES * (avg_genre - 5)
@@ -55,7 +57,7 @@ class RecommenderService:
             actor_scores = []
             actors = [a.strip() for a in movie.actors.split(', ')[:5] if a.strip()]
             for actor in actors:
-                a_rating = get_entity_rating(session, 'actor', actor)
+                a_rating = get_actor_rating(session, actor)
                 if a_rating and a_rating.avg_rating is not None:
                     actor_scores.append(a_rating.avg_rating)
             if actor_scores:
