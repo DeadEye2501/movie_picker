@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.orm import Session
 
@@ -7,6 +7,15 @@ from api import TMDBAPI, OMDBAPI, KinopoiskAPI, MDBListAPI
 from database import get_movie_by_kp_id, save_movie, search_local_movies
 from database.models import Movie
 from .recommender import RecommenderService
+
+
+def _check_shutdown() -> bool:
+    """Check if app is shutting down (lazy import to avoid circular dependency)."""
+    try:
+        from ui.app import is_shutting_down
+        return is_shutting_down()
+    except ImportError:
+        return False
 
 
 class SearchService:
@@ -208,7 +217,7 @@ class SearchService:
                 continue
 
             existing_movie = get_movie_by_kp_id(session, kp_id, is_tv)
-            if existing_movie and existing_movie.director:
+            if existing_movie and existing_movie.director_list:
                 movies.append(existing_movie)
                 # Track movies needing ratings (will be fetched later if skip_ratings=True)
                 if not skip_ratings:
@@ -244,7 +253,7 @@ class SearchService:
 
         return movies
 
-    def fetch_missing_ratings(self, session: Session, movies: list[Movie], on_movie_updated: Optional[callable] = None):
+    def fetch_missing_ratings(self, session: Session, movies: list[Movie], on_movie_updated: Optional[Callable] = None):
         """Fetch missing ratings for movies in background.
 
         Args:
@@ -280,6 +289,8 @@ class SearchService:
                     for movie in movies_needing_external
                 }
                 for future in as_completed(futures):
+                    if _check_shutdown():
+                        return
                     movie = futures[future]
                     try:
                         ratings = future.result()
@@ -308,6 +319,8 @@ class SearchService:
                     for movie in movies_needing_kp
                 }
                 for future in as_completed(futures):
+                    if _check_shutdown():
+                        return
                     movie = futures[future]
                     try:
                         kp_rating = future.result()
@@ -539,12 +552,13 @@ class SearchService:
 
     def _matches_genres(self, movie: Movie, genre_ids: list[int]) -> bool:
         """Check if movie matches ALL selected genres (AND logic)."""
-        if not movie.genres:
+        if not movie.genre_list:
             return False
 
-        movie_genres_lower = movie.genres.lower()
+        # Get movie's genre names (lowercase)
+        movie_genre_names = {g.name.lower() for g in movie.genre_list}
 
-        # Map genre IDs to Russian names for matching
+        # Map TMDB genre IDs to Russian names for matching
         genre_names = {
             28: "боевик", 12: "приключения", 16: "мультфильм", 35: "комедия",
             80: "криминал", 99: "документальный", 18: "драма", 10751: "семейный",
@@ -560,7 +574,7 @@ class SearchService:
         # AND logic: movie must have ALL selected genres
         for genre_id in genre_ids:
             genre_name = genre_names.get(genre_id, "")
-            if genre_name and genre_name not in movie_genres_lower:
+            if genre_name and genre_name not in movie_genre_names:
                 return False  # Missing this genre
 
         return True
@@ -572,12 +586,12 @@ class SearchService:
             parts.append(movie.title.lower())
         if movie.title_original:
             parts.append(movie.title_original.lower())
-        if movie.genres:
-            parts.append(movie.genres.lower())
-        if movie.director:
-            parts.append(movie.director.lower())
-        if movie.actors:
-            parts.append(movie.actors.lower())
+        if movie.genre_list:
+            parts.append(movie.genres_display.lower())
+        if movie.director_list:
+            parts.append(movie.directors_display.lower())
+        if movie.actor_list:
+            parts.append(movie.actors_display.lower())
         if movie.description:
             parts.append(movie.description.lower())
 

@@ -53,9 +53,9 @@ class MovieCard(ft.Container):
                 ft.Column(
                     controls=[
                         self._build_title_row(),
-                        self._build_info_text(self.movie.genres, "Жанры: "),
-                        self._build_clickable_person("Режиссёр: ", self.movie.director, "director"),
-                        self._build_clickable_person("Актёры: ", self.movie.actors, "actor"),
+                        self._build_info_text(self.movie.genres_display, "Жанры: "),
+                        self._build_clickable_person("Режиссёр: ", self.movie.directors_display, "director"),
+                        self._build_clickable_person("Актёры: ", self.movie.actors_display, "actor"),
                         self._build_description(),
                         ft.Divider(height=1, color=COLORS["divider"]),
                         self._build_ratings_row(),

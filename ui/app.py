@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 
 import flet as ft
 
@@ -14,6 +15,14 @@ from services import SearchService, RecommenderService
 from ui.theme import COLORS, get_dark_theme
 from ui.components import SearchBar, MovieList
 from ui.components.rating_dialog import show_rating_dialog
+
+# Global flag to signal background tasks to stop
+_shutdown_event = threading.Event()
+
+
+def is_shutting_down() -> bool:
+    """Check if the application is shutting down."""
+    return _shutdown_event.is_set()
 
 
 class MoviePickerApp:
@@ -56,9 +65,10 @@ class MoviePickerApp:
         page.window.width = 900
         page.window.height = 700
 
-        # Force exit on window close to prevent zombie processes
+        # Handle window close gracefully
         def on_window_event(e):
             if e.data == "close":
+                _shutdown_event.set()  # Signal background tasks to stop
                 close_db()  # Close database connections
                 os._exit(0)
 
@@ -99,11 +109,17 @@ class MoviePickerApp:
         self._show_loading()
 
         def do_search():
+            if is_shutting_down():
+                return
             try:
                 with get_session() as session:
+                    if is_shutting_down():
+                        return
                     # Load movies quickly without external ratings
                     movies = self.search_service.search_movies(session, query, genres=genres or [], skip_ratings=True)
 
+                    if is_shutting_down():
+                        return
                     if movies:
                         ratings = self._get_ratings_for_movies(movies)
                         wishlist_ids = get_wishlist_movie_ids(session)
@@ -115,7 +131,8 @@ class MoviePickerApp:
                     else:
                         self.movie_list.set_message("По вашему запросу ничего не найдено")
             except Exception as e:
-                self.movie_list.set_message(f"Ошибка при поиске: {str(e)}")
+                if not is_shutting_down():
+                    self.movie_list.set_message(f"Ошибка при поиске: {str(e)}")
 
         self.page.run_thread(do_search)
 
@@ -222,10 +239,16 @@ class MoviePickerApp:
         self._show_loading()
 
         def do_magic():
+            if is_shutting_down():
+                return
             try:
                 with get_session() as session:
+                    if is_shutting_down():
+                        return
                     movie = self.search_service.find_magic_recommendation(session)
 
+                    if is_shutting_down():
+                        return
                     if movie:
                         ratings = self._get_ratings_for_movies([movie])
                         wishlist_ids = get_wishlist_movie_ids(session)
@@ -236,7 +259,8 @@ class MoviePickerApp:
                     else:
                         self.movie_list.set_message("Оцените несколько фильмов, чтобы получить рекомендации")
             except Exception as e:
-                self.movie_list.set_message(f"Ошибка: {str(e)}")
+                if not is_shutting_down():
+                    self.movie_list.set_message(f"Ошибка: {str(e)}")
 
         self.page.run_thread(do_magic)
 
@@ -299,10 +323,16 @@ class MoviePickerApp:
         self._show_loading()
 
         def do_search():
+            if is_shutting_down():
+                return
             try:
                 with get_session() as session:
+                    if is_shutting_down():
+                        return
                     movies = self.search_service.search_movies(session, name, skip_ratings=True)
 
+                    if is_shutting_down():
+                        return
                     if movies:
                         ratings = self._get_ratings_for_movies(movies)
                         wishlist_ids = get_wishlist_movie_ids(session)
@@ -313,7 +343,8 @@ class MoviePickerApp:
                     else:
                         self.movie_list.set_message(f"Фильмы с {name} не найдены")
             except Exception as e:
-                self.movie_list.set_message(f"Ошибка при поиске: {str(e)}")
+                if not is_shutting_down():
+                    self.movie_list.set_message(f"Ошибка при поиске: {str(e)}")
 
         self.page.run_thread(do_search)
 
@@ -340,10 +371,16 @@ class MoviePickerApp:
         self._show_loading()
 
         def do_similar():
+            if is_shutting_down():
+                return
             try:
                 with get_session() as session:
+                    if is_shutting_down():
+                        return
                     movies = self.search_service.find_similar_movies(session, movie)
 
+                    if is_shutting_down():
+                        return
                     if movies:
                         ratings = self._get_ratings_for_movies(movies)
                         wishlist_ids = get_wishlist_movie_ids(session)
@@ -354,7 +391,8 @@ class MoviePickerApp:
                     else:
                         self.movie_list.set_message("Похожие фильмы не найдены")
             except Exception as e:
-                self.movie_list.set_message(f"Ошибка: {str(e)}")
+                if not is_shutting_down():
+                    self.movie_list.set_message(f"Ошибка: {str(e)}")
 
         self.page.run_thread(do_similar)
 
@@ -387,9 +425,13 @@ class MoviePickerApp:
     def _load_ratings_background(self, movies: list):
         """Load missing ratings in background and update UI."""
         def do_load():
+            if is_shutting_down():
+                return
             try:
                 with get_session() as session:
                     def on_movie_updated(movie):
+                        if is_shutting_down():
+                            return
                         # Update UI when a movie's ratings are loaded
                         self.movie_list.update_movie_data(movie)
 
@@ -397,8 +439,9 @@ class MoviePickerApp:
             except Exception:
                 pass  # Silently ignore rating fetch errors
             finally:
-                # Turn off loading indicators when done
-                self.movie_list.set_ratings_loading(False)
+                if not is_shutting_down():
+                    # Turn off loading indicators when done
+                    self.movie_list.set_ratings_loading(False)
 
         self.page.run_thread(do_load)
 

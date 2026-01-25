@@ -228,14 +228,57 @@ class MovieList(ft.Container):
         self._refresh()
 
     def update_movie_data(self, movie: Movie):
-        """Update movie data (e.g., ratings) and refresh the display."""
+        """Update movie data (e.g., ratings) without full refresh."""
+        # Update movie in list
         for i, m in enumerate(self.movies):
             if m.id == movie.id:
                 self.movies[i] = movie
                 break
-        self._refresh()
+
+        # Find and update only the specific card on current page
+        start_idx = self.current_page * self.ITEMS_PER_PAGE
+        end_idx = start_idx + self.ITEMS_PER_PAGE
+        page_movies = self.movies[start_idx:end_idx]
+
+        for i, m in enumerate(page_movies):
+            if m.id == movie.id and i < len(self.movies_column.controls):
+                card = self.movies_column.controls[i]
+                if isinstance(card, MovieCard):
+                    # Update card's movie data and rebuild its content
+                    card.movie = movie
+                    # Check if this movie still needs loading indicator
+                    card.ratings_loading = self.ratings_loading and (
+                        movie.imdb_rating is None or
+                        movie.kp_rating is None or
+                        movie.rotten_tomatoes is None or
+                        movie.metacritic is None
+                    )
+                    card.content = card._build_content()
+                    card.update()
+                break
 
     def set_ratings_loading(self, loading: bool):
         """Set whether external ratings are being loaded."""
+        if self.ratings_loading == loading:
+            return  # No change
         self.ratings_loading = loading
-        self._refresh()
+
+        # Update only the loading state of visible cards without full rebuild
+        start_idx = self.current_page * self.ITEMS_PER_PAGE
+        end_idx = start_idx + self.ITEMS_PER_PAGE
+        page_movies = self.movies[start_idx:end_idx]
+
+        for i, movie in enumerate(page_movies):
+            if i < len(self.movies_column.controls):
+                card = self.movies_column.controls[i]
+                if isinstance(card, MovieCard):
+                    movie_ratings_loading = loading and (
+                        movie.imdb_rating is None or
+                        movie.kp_rating is None or
+                        movie.rotten_tomatoes is None or
+                        movie.metacritic is None
+                    )
+                    if card.ratings_loading != movie_ratings_loading:
+                        card.ratings_loading = movie_ratings_loading
+                        card.content = card._build_content()
+                        card.update()

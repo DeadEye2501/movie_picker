@@ -1,12 +1,16 @@
 import os
 from contextlib import contextmanager
 from typing import Optional, Generator
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, or_
 from sqlalchemy.orm import sessionmaker, Session
 
 import json
 from datetime import timedelta, timezone
-from .models import Base, Movie, UserRating, Genre, GenreRating, DirectorRating, ActorRating, Wishlist, RecommendationCache, utc_now
+from .models import (
+    Base, Movie, UserRating, Genre, Director, Actor,
+    MovieGenre, MovieDirector, MovieActor,
+    Wishlist, RecommendationCache, utc_now
+)
 from .genre_utils import GENRE_SEED_DATA, normalize_genres, init_genre_cache, clear_cache
 
 _engine = None
@@ -69,6 +73,10 @@ def get_session() -> Generator[Session, None, None]:
         session.close()
 
 
+# =============================================================================
+# Movie CRUD
+# =============================================================================
+
 def get_movie_by_kp_id(session: Session, kinopoisk_id: int, is_tv: bool = False) -> Optional[Movie]:
     """Get a movie/TV show by its TMDB ID and type."""
     return session.query(Movie).filter(
@@ -78,22 +86,166 @@ def get_movie_by_kp_id(session: Session, kinopoisk_id: int, is_tv: bool = False)
 
 
 def save_movie(session: Session, movie_data: dict) -> Movie:
-    """Save or update a movie/TV show in the database."""
+    """Save or update a movie/TV show in the database.
+
+    Handles M2M relationships for genres, directors, and actors.
+    Expected keys in movie_data:
+        - genres: comma-separated string "драма, комедия"
+        - directors: list of dicts [{"tmdb_id": 123, "name": "Name"}, ...]
+        - actors: list of dicts [{"tmdb_id": 456, "name": "Name"}, ...]
+    """
     is_tv = movie_data.get("is_tv", False)
-    movie = get_movie_by_kp_id(session, movie_data["kinopoisk_id"], is_tv)
+    kinopoisk_id = movie_data["kinopoisk_id"]
+    movie = get_movie_by_kp_id(session, kinopoisk_id, is_tv)
 
-    if movie is None:
-        movie = Movie(**movie_data)
-        session.add(movie)
-    else:
-        for key, value in movie_data.items():
-            if hasattr(movie, key) and key != "id":
-                setattr(movie, key, value)
+    # Extract M2M data
+    genres_string = movie_data.pop("genres", None)
+    directors_list = movie_data.pop("directors", None)
+    actors_list = movie_data.pop("actors", None)
 
-    session.commit()
-    session.refresh(movie)
+    try:
+        if movie is None:
+            movie = Movie(**movie_data)
+            session.add(movie)
+            session.flush()  # Get movie.id before setting M2M
+        else:
+            for key, value in movie_data.items():
+                if hasattr(movie, key) and key != "id":
+                    setattr(movie, key, value)
+
+        # Set M2M relationships
+        if genres_string is not None:
+            set_movie_genres(session, movie, genres_string)
+        if directors_list is not None:
+            set_movie_directors(session, movie, directors_list)
+        if actors_list is not None:
+            set_movie_actors(session, movie, actors_list)
+
+        session.commit()
+        session.refresh(movie)
+    except Exception:
+        session.rollback()
+        # Re-fetch movie after rollback if it existed
+        movie = get_movie_by_kp_id(session, kinopoisk_id, is_tv)
+        if movie is None:
+            raise
+
     return movie
 
+
+# =============================================================================
+# M2M Setters
+# =============================================================================
+
+def set_movie_genres(session: Session, movie: Movie, genres_string: str):
+    """Set movie genres from a comma-separated string."""
+    session.query(MovieGenre).filter(MovieGenre.movie_id == movie.id).delete()
+
+    if not genres_string:
+        return
+
+    genre_ids = normalize_genres(genres_string, session)
+    seen_genre_ids = set()
+    for genre_id in genre_ids:
+        if genre_id not in seen_genre_ids:
+            seen_genre_ids.add(genre_id)
+            session.add(MovieGenre(movie_id=movie.id, genre_id=genre_id))
+
+
+def set_movie_directors(session: Session, movie: Movie, directors: list[dict]):
+    """Set movie directors from a list of dicts with tmdb_id and name."""
+    session.query(MovieDirector).filter(MovieDirector.movie_id == movie.id).delete()
+
+    if not directors:
+        return
+
+    seen_tmdb_ids = set()
+
+    for d in directors:
+        tmdb_id = d.get("tmdb_id")
+        name = d.get("name")
+        if not tmdb_id or not name:
+            continue
+        if tmdb_id in seen_tmdb_ids:
+            continue
+        seen_tmdb_ids.add(tmdb_id)
+
+        director = get_or_create_director(session, tmdb_id, name)
+        session.add(MovieDirector(movie_id=movie.id, director_id=director.id))
+
+
+def set_movie_actors(session: Session, movie: Movie, actors: list[dict], limit: int = 10):
+    """Set movie actors from a list of dicts with tmdb_id and name."""
+    session.query(MovieActor).filter(MovieActor.movie_id == movie.id).delete()
+
+    if not actors:
+        return
+
+    seen_tmdb_ids = set()
+    order = 0
+
+    for a in actors[:limit]:
+        tmdb_id = a.get("tmdb_id")
+        name = a.get("name")
+        if not tmdb_id or not name:
+            continue
+        if tmdb_id in seen_tmdb_ids:
+            continue
+        seen_tmdb_ids.add(tmdb_id)
+
+        actor = get_or_create_actor(session, tmdb_id, name)
+        session.add(MovieActor(movie_id=movie.id, actor_id=actor.id, order=order))
+        order += 1
+
+
+# =============================================================================
+# Entity Getters/Creators
+# =============================================================================
+
+def get_or_create_director(session: Session, tmdb_id: int, name: str) -> Director:
+    """Get existing director by TMDB ID or create new one."""
+    director = session.query(Director).filter(Director.tmdb_id == tmdb_id).first()
+    if director is None:
+        director = Director(tmdb_id=tmdb_id, name=name)
+        session.add(director)
+        session.flush()
+    elif director.name != name:
+        # Update name if changed (e.g., different localization)
+        director.name = name
+    return director
+
+
+def get_or_create_actor(session: Session, tmdb_id: int, name: str) -> Actor:
+    """Get existing actor by TMDB ID or create new one."""
+    actor = session.query(Actor).filter(Actor.tmdb_id == tmdb_id).first()
+    if actor is None:
+        actor = Actor(tmdb_id=tmdb_id, name=name)
+        session.add(actor)
+        session.flush()
+    elif actor.name != name:
+        # Update name if changed (e.g., different localization)
+        actor.name = name
+    return actor
+
+
+def get_genre_by_id(session: Session, genre_id: int) -> Optional[Genre]:
+    """Get genre by ID."""
+    return session.query(Genre).filter(Genre.id == genre_id).first()
+
+
+def get_director_by_id(session: Session, director_id: int) -> Optional[Director]:
+    """Get director by ID."""
+    return session.query(Director).filter(Director.id == director_id).first()
+
+
+def get_actor_by_id(session: Session, actor_id: int) -> Optional[Actor]:
+    """Get actor by ID."""
+    return session.query(Actor).filter(Actor.id == actor_id).first()
+
+
+# =============================================================================
+# User Ratings
+# =============================================================================
 
 def get_user_rating(session: Session, movie_id: int) -> Optional[UserRating]:
     """Get user rating for a movie."""
@@ -120,70 +272,35 @@ def save_user_rating(session: Session, movie_id: int, rating: int, review: Optio
     session.commit()
     session.refresh(user_rating)
 
-    # Update entity ratings (genres, director, actors)
+    # Update entity ratings (genres, directors, actors)
     movie = session.get(Movie, movie_id)
     if movie:
-        update_entity_ratings(session, movie, rating)
+        update_entity_ratings(session, movie)
         session.commit()
 
     return user_rating
 
 
-def get_all_user_ratings(session: Session) -> list[UserRating]:
-    """Get all user ratings with their associated movies."""
-    return session.query(UserRating).all()
-
-
 def delete_user_rating(session: Session, movie_id: int) -> bool:
-    """Delete user rating for a movie and recalculate entity ratings.
-
-    Returns True if rating was deleted, False if it didn't exist.
-    """
+    """Delete user rating for a movie and recalculate entity ratings."""
     user_rating = get_user_rating(session, movie_id)
     if user_rating is None:
         return False
 
-    # Get movie to recalculate entity ratings
     movie = session.get(Movie, movie_id)
-
-    # Delete the rating
     session.delete(user_rating)
     session.commit()
 
-    # Recalculate entity ratings
     if movie:
-        _recalculate_entity_ratings_for_movie(session, movie)
+        update_entity_ratings(session, movie)
         session.commit()
 
     return True
 
 
-def _recalculate_entity_ratings_for_movie(session: Session, movie: Movie):
-    """Recalculate entity ratings for all entities associated with a movie."""
-    # Load all rated movies ONCE
-    all_rated = session.query(Movie).join(UserRating).all()
-
-    # Pre-compute genre IDs for all rated movies ONCE
-    movie_genres_map: dict[int, list[int]] = {}
-    for m in all_rated:
-        if m.genres:
-            movie_genres_map[m.id] = normalize_genres(m.genres, session)
-
-    # Recalculate genre ratings
-    if movie.genres:
-        genre_ids = normalize_genres(movie.genres, session)
-        for genre_id in genre_ids:
-            _update_genre_rating(session, genre_id, all_rated, movie_genres_map)
-
-    # Recalculate director rating
-    if movie.director:
-        _update_director_rating(session, movie.director.strip().lower(), all_rated)
-
-    # Recalculate actor ratings (top 5)
-    if movie.actors:
-        actors = [a.strip().lower() for a in movie.actors.split(', ')[:5] if a.strip()]
-        for actor in actors:
-            _update_actor_rating(session, actor, all_rated)
+def get_all_user_ratings(session: Session) -> list[UserRating]:
+    """Get all user ratings with their associated movies."""
+    return session.query(UserRating).all()
 
 
 def get_all_user_ratings_filtered(
@@ -193,215 +310,163 @@ def get_all_user_ratings_filtered(
     max_rating: Optional[int] = None,
     genres: Optional[list[str]] = None,
 ) -> list[UserRating]:
-    """Get user ratings with sorting and filtering.
-
-    Args:
-        session: Database session
-        sort_by: Sort option (rating_desc, rating_asc, date_desc, date_asc,
-                 year_desc, year_asc, title_asc)
-        min_rating: Minimum rating filter (inclusive)
-        max_rating: Maximum rating filter (inclusive)
-        genres: List of genre names to filter by (case-insensitive, any match)
-
-    Returns:
-        List of UserRating objects matching the criteria
-    """
+    """Get user ratings with sorting and filtering."""
     query = session.query(UserRating).join(Movie)
 
-    # Apply rating filter
     if min_rating is not None:
         query = query.filter(UserRating.rating >= min_rating)
     if max_rating is not None:
         query = query.filter(UserRating.rating <= max_rating)
 
-    # Get all matching ratings first
     user_ratings = query.all()
 
-    # Apply genre filter in Python (SQLite doesn't handle LIKE well with Cyrillic)
+    # Apply genre filter using M2M relationship
     if genres:
         genres_lower = [g.lower() for g in genres]
         filtered = []
         for ur in user_ratings:
-            if ur.movie.genres:
-                movie_genres = [g.strip().lower() for g in ur.movie.genres.split(', ')]
-                if any(g in movie_genres for g in genres_lower):
-                    filtered.append(ur)
+            movie_genres = [g.name.lower() for g in ur.movie.genre_list]
+            if any(g in movie_genres for g in genres_lower):
+                filtered.append(ur)
         user_ratings = filtered
 
     # Apply sorting
-    if sort_by == "rating_desc":
-        user_ratings.sort(key=lambda ur: ur.rating, reverse=True)
-    elif sort_by == "rating_asc":
-        user_ratings.sort(key=lambda ur: ur.rating)
-    elif sort_by == "date_desc":
-        user_ratings.sort(key=lambda ur: ur.updated_at or ur.created_at, reverse=True)
-    elif sort_by == "date_asc":
-        user_ratings.sort(key=lambda ur: ur.updated_at or ur.created_at)
-    elif sort_by == "year_desc":
-        user_ratings.sort(key=lambda ur: ur.movie.year or 0, reverse=True)
-    elif sort_by == "year_asc":
-        user_ratings.sort(key=lambda ur: ur.movie.year or 0)
-    elif sort_by == "title_asc":
-        user_ratings.sort(key=lambda ur: ur.movie.title.lower())
-    elif sort_by == "title_desc":
-        user_ratings.sort(key=lambda ur: ur.movie.title.lower(), reverse=True)
+    sort_keys = {
+        "rating_desc": (lambda ur: ur.rating, True),
+        "rating_asc": (lambda ur: ur.rating, False),
+        "date_desc": (lambda ur: ur.updated_at or ur.created_at, True),
+        "date_asc": (lambda ur: ur.updated_at or ur.created_at, False),
+        "year_desc": (lambda ur: ur.movie.year or 0, True),
+        "year_asc": (lambda ur: ur.movie.year or 0, False),
+        "title_asc": (lambda ur: ur.movie.title.lower(), False),
+        "title_desc": (lambda ur: ur.movie.title.lower(), True),
+    }
+    if sort_by in sort_keys:
+        key_func, reverse = sort_keys[sort_by]
+        user_ratings.sort(key=key_func, reverse=reverse)
 
     return user_ratings
 
 
 def get_rated_movies(session: Session, min_rating: Optional[int] = None) -> list[Movie]:
-    """Get all movies that have user ratings, optionally filtered by minimum rating."""
+    """Get all movies that have user ratings."""
     query = session.query(Movie).join(UserRating)
     if min_rating is not None:
         query = query.filter(UserRating.rating >= min_rating)
     return query.all()
 
 
-def search_local_movies(session: Session, query: str) -> list[Movie]:
-    """Search movies in local database by title, director, actors, or description."""
-    search_term = f"%{query.lower()}%"
-    from sqlalchemy import func
-    return session.query(Movie).filter(
-        (func.lower(Movie.title).like(search_term)) |
-        (func.lower(Movie.title_original).like(search_term)) |
-        (func.lower(Movie.director).like(search_term)) |
-        (func.lower(Movie.actors).like(search_term)) |
-        (func.lower(Movie.genres).like(search_term)) |
-        (func.lower(Movie.description).like(search_term))
+# =============================================================================
+# Entity Rating Calculations
+# =============================================================================
+
+def update_entity_ratings(session: Session, movie: Movie):
+    """Update ratings for all entities (genres, directors, actors) related to a movie."""
+    # Update genres
+    for genre in movie.genre_list:
+        _recalculate_genre_rating(session, genre)
+
+    # Update directors
+    for director in movie.director_list:
+        _recalculate_director_rating(session, director)
+
+    # Update actors
+    for actor in movie.actor_list:
+        _recalculate_actor_rating(session, actor)
+
+
+def _recalculate_genre_rating(session: Session, genre: Genre):
+    """Recalculate average rating for a genre."""
+    # Get all rated movies with this genre
+    rated_movies = session.query(Movie).join(UserRating).join(MovieGenre).filter(
+        MovieGenre.genre_id == genre.id
     ).all()
 
-
-def get_genre_rating(session: Session, genre_id: int) -> Optional[GenreRating]:
-    """Get genre rating by genre ID."""
-    return session.query(GenreRating).filter(GenreRating.genre_id == genre_id).first()
-
-
-def get_director_rating(session: Session, director_name: str) -> Optional[DirectorRating]:
-    """Get director rating by name."""
-    return session.query(DirectorRating).filter(
-        DirectorRating.director_name == director_name.lower().strip()
-    ).first()
-
-
-def get_actor_rating(session: Session, actor_name: str) -> Optional[ActorRating]:
-    """Get actor rating by name."""
-    return session.query(ActorRating).filter(
-        ActorRating.actor_name == actor_name.lower().strip()
-    ).first()
-
-
-def update_entity_ratings(session: Session, movie: Movie, user_rating: int):
-    """Update all entity ratings based on a movie's user rating."""
-    # Load all rated movies ONCE
-    all_rated = session.query(Movie).join(UserRating).all()
-
-    # Pre-compute genre IDs for all rated movies ONCE
-    movie_genres_map: dict[int, list[int]] = {}
-    for m in all_rated:
-        if m.genres:
-            movie_genres_map[m.id] = normalize_genres(m.genres, session)
-
-    # Update genre ratings
-    if movie.genres:
-        genre_ids = normalize_genres(movie.genres, session)
-        for genre_id in genre_ids:
-            _update_genre_rating(session, genre_id, all_rated, movie_genres_map)
-
-    # Update director rating
-    if movie.director:
-        _update_director_rating(session, movie.director.strip().lower(), all_rated)
-
-    # Update actor ratings (top 5)
-    if movie.actors:
-        actors = [a.strip().lower() for a in movie.actors.split(', ')[:5] if a.strip()]
-        for actor in actors:
-            _update_actor_rating(session, actor, all_rated)
-
-
-def _update_genre_rating(
-    session: Session,
-    genre_id: int,
-    all_rated: list[Movie],
-    movie_genres_map: dict[int, list[int]]
-):
-    """Recalculate average rating for a genre."""
-    movies_with_genre = [
-        m for m in all_rated
-        if genre_id in movie_genres_map.get(m.id, [])
-    ]
-
-    if not movies_with_genre:
-        rating = get_genre_rating(session, genre_id)
-        if rating:
-            session.delete(rating)
-        return
-
-    total = sum(m.user_rating.rating for m in movies_with_genre)
-    count = len(movies_with_genre)
-    avg = total / count
-
-    rating = get_genre_rating(session, genre_id)
-    if rating is None:
-        rating = GenreRating(genre_id=genre_id, avg_rating=avg, count=count)
-        session.add(rating)
+    if not rated_movies:
+        genre.avg_rating = None
+        genre.rating_count = 0
     else:
-        rating.avg_rating = avg
-        rating.count = count
+        total = sum(m.user_rating.rating for m in rated_movies)
+        genre.avg_rating = total / len(rated_movies)
+        genre.rating_count = len(rated_movies)
 
 
-def _update_director_rating(session: Session, director_name: str, all_rated: list[Movie]):
+def _recalculate_director_rating(session: Session, director: Director):
     """Recalculate average rating for a director."""
-    movies_with_director = [
-        m for m in all_rated
-        if m.director and m.director.lower() == director_name
-    ]
+    rated_movies = session.query(Movie).join(UserRating).join(MovieDirector).filter(
+        MovieDirector.director_id == director.id
+    ).all()
 
-    if not movies_with_director:
-        rating = get_director_rating(session, director_name)
-        if rating:
-            session.delete(rating)
-        return
-
-    total = sum(m.user_rating.rating for m in movies_with_director)
-    count = len(movies_with_director)
-    avg = total / count
-
-    rating = get_director_rating(session, director_name)
-    if rating is None:
-        rating = DirectorRating(director_name=director_name, avg_rating=avg, count=count)
-        session.add(rating)
+    if not rated_movies:
+        director.avg_rating = None
+        director.rating_count = 0
     else:
-        rating.avg_rating = avg
-        rating.count = count
+        total = sum(m.user_rating.rating for m in rated_movies)
+        director.avg_rating = total / len(rated_movies)
+        director.rating_count = len(rated_movies)
 
 
-def _update_actor_rating(session: Session, actor_name: str, all_rated: list[Movie]):
+def _recalculate_actor_rating(session: Session, actor: Actor):
     """Recalculate average rating for an actor."""
-    movies_with_actor = []
-    for m in all_rated:
-        if m.actors:
-            movie_actors = [a.strip().lower() for a in m.actors.split(', ')]
-            if actor_name in movie_actors:
-                movies_with_actor.append(m)
+    rated_movies = session.query(Movie).join(UserRating).join(MovieActor).filter(
+        MovieActor.actor_id == actor.id
+    ).all()
 
-    if not movies_with_actor:
-        rating = get_actor_rating(session, actor_name)
-        if rating:
-            session.delete(rating)
-        return
-
-    total = sum(m.user_rating.rating for m in movies_with_actor)
-    count = len(movies_with_actor)
-    avg = total / count
-
-    rating = get_actor_rating(session, actor_name)
-    if rating is None:
-        rating = ActorRating(actor_name=actor_name, avg_rating=avg, count=count)
-        session.add(rating)
+    if not rated_movies:
+        actor.avg_rating = None
+        actor.rating_count = 0
     else:
-        rating.avg_rating = avg
-        rating.count = count
+        total = sum(m.user_rating.rating for m in rated_movies)
+        actor.avg_rating = total / len(rated_movies)
+        actor.rating_count = len(rated_movies)
 
+
+# =============================================================================
+# Search
+# =============================================================================
+
+def search_local_movies(session: Session, query: str) -> list[Movie]:
+    """Search movies in local database by title, description, genres, directors, or actors."""
+    search_term = f"%{query.lower()}%"
+
+    # Search in movie fields
+    movies_by_fields = session.query(Movie).filter(
+        or_(
+            func.lower(Movie.title).like(search_term),
+            func.lower(Movie.title_original).like(search_term),
+            func.lower(Movie.description).like(search_term),
+        )
+    ).all()
+
+    # Search by genre name
+    movies_by_genre = session.query(Movie).join(MovieGenre).join(Genre).filter(
+        func.lower(Genre.name).like(search_term)
+    ).all()
+
+    # Search by director name
+    movies_by_director = session.query(Movie).join(MovieDirector).join(Director).filter(
+        func.lower(Director.name).like(search_term)
+    ).all()
+
+    # Search by actor name
+    movies_by_actor = session.query(Movie).join(MovieActor).join(Actor).filter(
+        func.lower(Actor.name).like(search_term)
+    ).all()
+
+    # Combine results (unique movies)
+    movie_ids = set()
+    result = []
+    for movie in movies_by_fields + movies_by_genre + movies_by_director + movies_by_actor:
+        if movie.id not in movie_ids:
+            movie_ids.add(movie.id)
+            result.append(movie)
+
+    return result
+
+
+# =============================================================================
+# Recommendations Cache
+# =============================================================================
 
 def get_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, max_age_days: int = 7) -> Optional[list[int]]:
     """Get cached TMDB recommendations. Returns None if not cached or expired."""
@@ -413,8 +478,6 @@ def get_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, max_
     if cache is None:
         return None
 
-    # Check if cache is expired
-    # SQLite stores datetimes without timezone, so we need to make it aware
     cache_updated = cache.updated_at.replace(tzinfo=timezone.utc) if cache.updated_at.tzinfo is None else cache.updated_at
     if utc_now() - cache_updated > timedelta(days=max_age_days):
         return None
@@ -446,7 +509,9 @@ def save_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, rec
     session.commit()
 
 
-# Wishlist functions
+# =============================================================================
+# Wishlist
+# =============================================================================
 
 def is_in_wishlist(session: Session, movie_id: int) -> bool:
     """Check if movie is in wishlist."""
@@ -467,7 +532,7 @@ def add_to_wishlist(session: Session, movie_id: int) -> Wishlist:
 
 
 def remove_from_wishlist(session: Session, movie_id: int) -> bool:
-    """Remove movie from wishlist. Returns True if removed, False if not found."""
+    """Remove movie from wishlist."""
     item = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
     if item:
         session.delete(item)

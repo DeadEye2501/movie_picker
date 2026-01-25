@@ -161,8 +161,8 @@ class TMDBAPI:
         # Parse credits from same response
         credits_data = data.get("credits", {})
         credits = self._parse_credits(credits_data)
-        details["director"] = credits["director"]
-        details["actors"] = ", ".join(credits["actors"][:10])
+        details["directors"] = credits["directors"]
+        details["actors"] = credits["actors"][:10]
 
         return details
 
@@ -215,8 +215,8 @@ class TMDBAPI:
         # Parse credits from same response
         credits_data = data.get("credits", {})
         credits = self._parse_tv_credits(credits_data)
-        details["director"] = credits["director"]
-        details["actors"] = ", ".join(credits["actors"][:10])
+        details["directors"] = credits["directors"]
+        details["actors"] = credits["actors"][:10]
 
         return details
 
@@ -307,22 +307,29 @@ class TMDBAPI:
         }
 
     def _parse_tv_credits(self, credits: dict) -> dict:
-        """Parse TV credits to extract creator and actors."""
-        director = None  # For TV shows, we use creator
+        """Parse TV credits to extract creator and actors with TMDB IDs."""
+        directors = []
         actors = []
 
         # TV shows often have "created_by" in details, but credits has crew
         for person in credits.get("crew", []):
             job = person.get("job", "")
-            if job in ("Executive Producer", "Creator") and director is None:
-                director = person.get("name")
+            if job in ("Executive Producer", "Creator"):
+                directors.append({
+                    "tmdb_id": person.get("id"),
+                    "name": person.get("name"),
+                })
 
         for person in credits.get("cast", []):
+            tmdb_id = person.get("id")
             name = person.get("name")
-            if name:
-                actors.append(name)
+            if tmdb_id and name:
+                actors.append({
+                    "tmdb_id": tmdb_id,
+                    "name": name,
+                })
 
-        return {"director": director, "actors": actors}
+        return {"directors": directors, "actors": actors}
 
     # ========== MOVIE METHODS ==========
 
@@ -527,17 +534,24 @@ class TMDBAPI:
         }
 
     def _parse_credits(self, credits: dict) -> dict:
-        """Parse credits to extract director and actors."""
-        director = None
+        """Parse credits to extract director and actors with TMDB IDs."""
+        directors = []
         actors = []
 
         for person in credits.get("crew", []):
-            if person.get("job") == "Director" and director is None:
-                director = person.get("name")
+            if person.get("job") == "Director":
+                directors.append({
+                    "tmdb_id": person.get("id"),
+                    "name": person.get("name"),
+                })
 
         for person in credits.get("cast", []):
+            tmdb_id = person.get("id")
             name = person.get("name")
-            if name:
-                actors.append(name)
+            if tmdb_id and name:
+                actors.append({
+                    "tmdb_id": tmdb_id,
+                    "name": name,
+                })
 
-        return {"director": director, "actors": actors}
+        return {"directors": directors, "actors": actors}

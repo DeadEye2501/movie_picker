@@ -3,8 +3,8 @@ from sqlalchemy.orm import Session
 
 from database.models import Movie
 from database import (
-    get_all_user_ratings, get_genre_rating, get_director_rating, get_actor_rating,
-    get_cached_recommendations, save_cached_recommendations, normalize_genres
+    get_all_user_ratings,
+    get_cached_recommendations, save_cached_recommendations
 )
 from api import TMDBAPI
 
@@ -34,32 +34,32 @@ class RecommenderService:
         # 1. TMDB similarity score (main factor)
         score += self.WEIGHT_TMDB_SIMILARITY * self._tmdb_similarity_score(movie, session)
 
-        # 2. Director rating
-        if movie.director:
-            dir_rating = get_director_rating(session, movie.director)
-            if dir_rating and dir_rating.avg_rating is not None:
-                score += self.WEIGHT_DIRECTOR * (dir_rating.avg_rating - 5)
+        # 2. Director rating (from M2M relationship)
+        if movie.director_list:
+            dir_scores = []
+            for director in movie.director_list:
+                if director.avg_rating is not None:
+                    dir_scores.append(director.avg_rating)
+            if dir_scores:
+                avg_dir = sum(dir_scores) / len(dir_scores)
+                score += self.WEIGHT_DIRECTOR * (avg_dir - 5)
 
-        # 3. Genres (average of all known genres)
-        if movie.genres:
-            genre_ids = normalize_genres(movie.genres, session)
+        # 3. Genres (from M2M relationship)
+        if movie.genre_list:
             genre_scores = []
-            for genre_id in genre_ids:
-                g_rating = get_genre_rating(session, genre_id)
-                if g_rating and g_rating.avg_rating is not None:
-                    genre_scores.append(g_rating.avg_rating)
+            for genre in movie.genre_list:
+                if genre.avg_rating is not None:
+                    genre_scores.append(genre.avg_rating)
             if genre_scores:
                 avg_genre = sum(genre_scores) / len(genre_scores)
                 score += self.WEIGHT_GENRES * (avg_genre - 5)
 
-        # 4. Actors (top 5)
-        if movie.actors:
+        # 4. Actors (from M2M relationship)
+        if movie.actor_list:
             actor_scores = []
-            actors = [a.strip() for a in movie.actors.split(', ')[:5] if a.strip()]
-            for actor in actors:
-                a_rating = get_actor_rating(session, actor)
-                if a_rating and a_rating.avg_rating is not None:
-                    actor_scores.append(a_rating.avg_rating)
+            for actor in movie.actor_list[:5]:  # Top 5 actors
+                if actor.avg_rating is not None:
+                    actor_scores.append(actor.avg_rating)
             if actor_scores:
                 avg_actors = sum(actor_scores) / len(actor_scores)
                 score += self.WEIGHT_ACTORS * (avg_actors - 5)
