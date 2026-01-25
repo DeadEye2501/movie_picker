@@ -1,11 +1,12 @@
 import os
-from typing import Optional
+from contextlib import contextmanager
+from typing import Optional, Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 import json
 from datetime import timedelta, timezone
-from .models import Base, Movie, UserRating, Genre, GenreRating, DirectorRating, ActorRating, RecommendationCache, utc_now
+from .models import Base, Movie, UserRating, Genre, GenreRating, DirectorRating, ActorRating, Wishlist, RecommendationCache, utc_now
 from .genre_utils import GENRE_SEED_DATA, normalize_genres, init_genre_cache, clear_cache
 
 _engine = None
@@ -47,11 +48,25 @@ def _seed_genres(session: Session):
     session.commit()
 
 
-def get_session() -> Session:
-    """Get a new database session."""
+def close_db():
+    """Close the database engine and all connections."""
+    global _engine, _SessionLocal
+    if _engine:
+        _engine.dispose()
+        _engine = None
+        _SessionLocal = None
+
+
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    """Get a database session as context manager."""
     if _SessionLocal is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
-    return _SessionLocal(expire_on_commit=False)
+    session = _SessionLocal(expire_on_commit=False)
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 def get_movie_by_kp_id(session: Session, kinopoisk_id: int, is_tv: bool = False) -> Optional[Movie]:
@@ -97,11 +112,16 @@ def save_user_rating(session: Session, movie_id: int, rating: int, review: Optio
         if review is not None:
             user_rating.review = review
 
+    # Remove from wishlist if present (watched = no longer "want to watch")
+    wishlist_item = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    if wishlist_item:
+        session.delete(wishlist_item)
+
     session.commit()
     session.refresh(user_rating)
 
     # Update entity ratings (genres, director, actors)
-    movie = session.query(Movie).get(movie_id)
+    movie = session.get(Movie, movie_id)
     if movie:
         update_entity_ratings(session, movie, rating)
         session.commit()
@@ -124,7 +144,7 @@ def delete_user_rating(session: Session, movie_id: int) -> bool:
         return False
 
     # Get movie to recalculate entity ratings
-    movie = session.query(Movie).get(movie_id)
+    movie = session.get(Movie, movie_id)
 
     # Delete the rating
     session.delete(user_rating)
@@ -424,3 +444,44 @@ def save_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, rec
         cache.updated_at = utc_now()
 
     session.commit()
+
+
+# Wishlist functions
+
+def is_in_wishlist(session: Session, movie_id: int) -> bool:
+    """Check if movie is in wishlist."""
+    return session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first() is not None
+
+
+def add_to_wishlist(session: Session, movie_id: int) -> Wishlist:
+    """Add movie to wishlist."""
+    existing = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    if existing:
+        return existing
+
+    wishlist_item = Wishlist(movie_id=movie_id)
+    session.add(wishlist_item)
+    session.commit()
+    session.refresh(wishlist_item)
+    return wishlist_item
+
+
+def remove_from_wishlist(session: Session, movie_id: int) -> bool:
+    """Remove movie from wishlist. Returns True if removed, False if not found."""
+    item = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    if item:
+        session.delete(item)
+        session.commit()
+        return True
+    return False
+
+
+def get_wishlist(session: Session) -> list[Wishlist]:
+    """Get all wishlist items ordered by added date (newest first)."""
+    return session.query(Wishlist).order_by(Wishlist.added_at.desc()).all()
+
+
+def get_wishlist_movie_ids(session: Session) -> set[int]:
+    """Get set of movie IDs in wishlist (for quick lookup)."""
+    items = session.query(Wishlist.movie_id).all()
+    return {item[0] for item in items}

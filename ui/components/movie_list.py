@@ -17,16 +17,22 @@ class MovieList(ft.Container):
         on_review_click: Optional[Callable[[Movie], None]] = None,
         on_similar_click: Optional[Callable[[Movie], None]] = None,
         on_rating_delete: Optional[Callable[[Movie], None]] = None,
+        on_wishlist_toggle: Optional[Callable[[Movie, bool], None]] = None,
+        on_person_click: Optional[Callable[[str, str], None]] = None,
     ):
         self.movies: list[Movie] = []
         self.ratings: dict[int, UserRating] = {}
+        self.wishlist_ids: set[int] = set()
         self.current_page = 0
         self.on_rating_change = on_rating_change
         self.on_review_click = on_review_click
         self.on_similar_click = on_similar_click
         self.on_rating_delete = on_rating_delete
+        self.on_wishlist_toggle = on_wishlist_toggle
+        self.on_person_click = on_person_click
         self.message: Optional[str] = None
         self.is_loading = False
+        self.ratings_loading = False  # True when external ratings are being fetched
 
         self.movies_column = ft.Column(
             spacing=8,
@@ -94,11 +100,19 @@ class MovieList(ft.Container):
         self.dots_container.visible = False
         self.update()
 
-    def set_movies(self, movies: list[Movie], ratings: Optional[dict[int, UserRating]] = None):
+    def set_movies(
+        self,
+        movies: list[Movie],
+        ratings: Optional[dict[int, UserRating]] = None,
+        wishlist_ids: Optional[set[int]] = None,
+        ratings_loading: bool = False
+    ):
         """Set the list of movies to display."""
         self.is_loading = False
         self.movies = movies
         self.ratings = ratings or {}
+        self.wishlist_ids = wishlist_ids or set()
+        self.ratings_loading = ratings_loading
         self.current_page = 0
         self.message = None
         self._refresh()
@@ -162,15 +176,27 @@ class MovieList(ft.Container):
                 rating_obj = self.ratings.get(movie.id)
                 user_rating = rating_obj.rating if rating_obj else None
                 user_review = rating_obj.review if rating_obj else None
+                in_wishlist = movie.id in self.wishlist_ids
+                # Show loading indicator only for movies missing external ratings
+                movie_ratings_loading = self.ratings_loading and (
+                    movie.imdb_rating is None or
+                    movie.kp_rating is None or
+                    movie.rotten_tomatoes is None or
+                    movie.metacritic is None
+                )
 
                 card = MovieCard(
                     movie=movie,
                     user_rating=user_rating,
                     user_review=user_review,
+                    in_wishlist=in_wishlist,
+                    ratings_loading=movie_ratings_loading,
                     on_rating_change=self.on_rating_change,
                     on_review_click=self.on_review_click,
                     on_similar_click=self.on_similar_click,
                     on_rating_delete=self.on_rating_delete,
+                    on_wishlist_toggle=self.on_wishlist_toggle,
+                    on_person_click=self.on_person_click,
                 )
                 self.movies_column.controls.append(card)
 
@@ -183,3 +209,33 @@ class MovieList(ft.Container):
         if 0 <= page < total_pages:
             self.current_page = page
             self._refresh()
+
+    def update_wishlist(self, movie_id: int, in_wishlist: bool):
+        """Update wishlist status for a movie."""
+        if in_wishlist:
+            self.wishlist_ids.add(movie_id)
+        else:
+            self.wishlist_ids.discard(movie_id)
+        self._refresh()
+
+    def remove_from_wishlist_view(self, movie_id: int):
+        """Remove movie from wishlist view (when in wishlist mode)."""
+        self.wishlist_ids.discard(movie_id)
+        self.movies = [m for m in self.movies if m.id != movie_id]
+        total_pages = max(1, (len(self.movies) + self.ITEMS_PER_PAGE - 1) // self.ITEMS_PER_PAGE)
+        if self.current_page >= total_pages:
+            self.current_page = max(0, total_pages - 1)
+        self._refresh()
+
+    def update_movie_data(self, movie: Movie):
+        """Update movie data (e.g., ratings) and refresh the display."""
+        for i, m in enumerate(self.movies):
+            if m.id == movie.id:
+                self.movies[i] = movie
+                break
+        self._refresh()
+
+    def set_ratings_loading(self, loading: bool):
+        """Set whether external ratings are being loaded."""
+        self.ratings_loading = loading
+        self._refresh()

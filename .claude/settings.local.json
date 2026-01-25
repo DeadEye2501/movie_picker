@@ -9,7 +9,14 @@
       "Bash(dir:*)",
       "Bash(del /f \"d:\\\\Projects\\\\Python Scripts\\\\Movie Picker\\\\movie_picker\\\\movie_picker.db\")",
       "Bash(pipenv run python:*)",
-      "WebFetch(domain:api.themoviedb.org)"
+      "WebFetch(domain:api.themoviedb.org)",
+      "Bash(pipenv run pip:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:trakt.docs.apiary.io)",
+      "WebFetch(domain:mdblist.docs.apiary.io)",
+      "WebFetch(domain:docs.mdblist.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pipenv run:*)"
     ]
   }
 }

@@ -26,18 +26,24 @@ def load_config() -> dict:
 
     tmdb_key = os.getenv("TMDB_API_KEY")
     omdb_key = os.getenv("OMDB_API_KEY")
+    kp_key = os.getenv("KINOPOISK_API_KEY")
+    mdblist_key = os.getenv("MDBLIST_API_KEY")
 
     if not tmdb_key:
         print("Error: TMDB_API_KEY not found in .env")
         print("Please create .env file with your API keys:")
         print("TMDB_API_KEY=your_key_here")
-        print("OMDB_API_KEY=your_key_here  # optional")
+        print("MDBLIST_API_KEY=your_key_here  # optional, for IMDB/RT/MC ratings")
+        print("OMDB_API_KEY=your_key_here  # optional, fallback for ratings")
+        print("KINOPOISK_API_KEY=your_key_here  # optional")
         print("\nGet your TMDB key at: https://www.themoviedb.org/settings/api")
         sys.exit(1)
 
     return {
         "tmdb_api_key": tmdb_key,
         "omdb_api_key": omdb_key,
+        "kp_api_key": kp_key,
+        "mdblist_api_key": mdblist_key,
     }
 
 
@@ -50,6 +56,8 @@ def main(page: ft.Page):
     app = MoviePickerApp(
         tmdb_api_key=config["tmdb_api_key"],
         omdb_api_key=config.get("omdb_api_key"),
+        kp_api_key=config.get("kp_api_key"),
+        mdblist_api_key=config.get("mdblist_api_key"),
         db_path=db_path,
     )
     app.build(page)

@@ -35,11 +35,13 @@ class SearchBar(ft.Container):
         self,
         on_search: Optional[Callable[[str, list[int]], None]] = None,
         on_my_ratings: Optional[Callable[[], None]] = None,
+        on_wishlist: Optional[Callable[[], None]] = None,
         on_magic: Optional[Callable[[], None]] = None,
         on_genre_change: Optional[Callable[[], None]] = None,
     ):
         self.on_search = on_search
         self.on_my_ratings = on_my_ratings
+        self.on_wishlist = on_wishlist
         self.on_magic = on_magic
         self.on_genre_change = on_genre_change
         self.selected_genres: list[int] = []
@@ -94,6 +96,9 @@ class SearchBar(ft.Container):
         self.ratings_button = None  # Will be built in _build_ratings_button
         self.ratings_icon_container = None
 
+        # Wishlist button
+        self.wishlist_button = None
+
         super().__init__(
             content=self._build_content(),
             margin=ft.margin.only(bottom=8),
@@ -127,6 +132,7 @@ class SearchBar(ft.Container):
                             height=36,
                         ),
                         self._build_ratings_button(),
+                        self._build_wishlist_button(),
                     ],
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -238,6 +244,10 @@ class SearchBar(ft.Container):
         if self.on_magic:
             self.on_magic()
 
+    def _handle_wishlist(self):
+        if self.on_wishlist:
+            self.on_wishlist()
+
     def get_query(self) -> str:
         return self.search_field.value or ""
 
@@ -284,6 +294,26 @@ class SearchBar(ft.Container):
         ]
         self.ratings_button.tooltip = "Мои оценки"
         self.ratings_icon_container.update()
+
+    def _build_wishlist_button(self) -> ft.IconButton:
+        """Build the wishlist button."""
+        self.wishlist_button = ft.IconButton(
+            icon=ft.Icons.BOOKMARK_BORDER,
+            icon_size=20,
+            icon_color=COLORS["text_primary"],
+            bgcolor=COLORS["surface_variant"],
+            on_click=lambda e: self._handle_wishlist(),
+            tooltip="Хочу посмотреть",
+            width=36,
+            height=36,
+        )
+        return self.wishlist_button
+
+    def set_wishlist_active(self, active: bool):
+        """Set wishlist button active state."""
+        self.wishlist_button.icon = ft.Icons.BOOKMARK if active else ft.Icons.BOOKMARK_BORDER
+        self.wishlist_button.icon_color = COLORS["primary"] if active else COLORS["text_primary"]
+        self.wishlist_button.update()
 
     def clear(self):
         self.search_field.value = ""

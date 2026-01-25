@@ -10,10 +10,11 @@ class OMDBAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self._client = httpx.Client(timeout=10.0)
+        self._disabled = False
 
     def get_ratings_by_imdb_id(self, imdb_id: str) -> dict:
         """Get ratings from OMDB by IMDB ID."""
-        if not imdb_id:
+        if not imdb_id or self._disabled:
             return {}
 
         try:
@@ -25,10 +26,22 @@ class OMDBAPI:
             data = response.json()
 
             if data.get("Response") == "False":
+                error = data.get("Error", "Unknown error")
+                if "limit" in error.lower():
+                    print("[OMDB] API limit reached - disabling for this session")
+                    self._disabled = True
                 return {}
 
             return self._parse_ratings(data)
-        except Exception:
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                print(f"[OMDB] Auth error ({e.response.status_code}) - disabling for this session")
+                self._disabled = True
+            else:
+                print(f"[OMDB] HTTP error: {e.response.status_code}")
+            return {}
+        except Exception as e:
+            print(f"[OMDB] Error: {e}")
             return {}
 
     def _parse_ratings(self, data: dict) -> dict:

@@ -30,6 +30,7 @@ class Movie(Base):
     poster_url = Column(String(1000), nullable=True)
     # Ratings from different sources
     tmdb_rating = Column(Float, nullable=True)
+    kp_rating = Column(Float, nullable=True)  # Kinopoisk rating
     imdb_rating = Column(Float, nullable=True)
     rotten_tomatoes = Column(Integer, nullable=True)  # percentage 0-100
     metacritic = Column(Integer, nullable=True)  # score 0-100
@@ -111,6 +112,20 @@ class ActorRating(Base):
 
     def __repr__(self):
         return f"<ActorRating(name='{self.actor_name}', avg={self.avg_rating}, count={self.count})>"
+
+
+class Wishlist(Base):
+    """Movies user wants to watch."""
+    __tablename__ = "wishlist"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    movie_id = Column(Integer, ForeignKey("movies.id"), nullable=False, unique=True)
+    added_at = Column(DateTime, default=utc_now)
+
+    movie = relationship("Movie")
+
+    def __repr__(self):
+        return f"<Wishlist(movie_id={self.movie_id})>"
 
 
 class RecommendationCache(Base):
