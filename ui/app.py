@@ -62,7 +62,7 @@ class MoviePickerApp:
         page.padding = 20
         page.window.width = 900
         page.window.height = 700
-
+        
         # Initialize database
         await init_db(self.db_path)
 
@@ -70,17 +70,32 @@ class MoviePickerApp:
         async def on_window_event(e):
             if e.data == "close":
                 _shutdown_event.set()  # Signal background tasks to stop
+                
+                # Give background tasks a moment to see the shutdown flag
+                await asyncio.sleep(0.2)
+                
                 # Close API clients
-                await self.tmdb_api.close()
-                if self.omdb_api:
-                    await self.omdb_api.close()
-                if self.kp_api:
-                    await self.kp_api.close()
-                if self.mdblist_api:
-                    await self.mdblist_api.close()
-                await self.search_service.close()
-                await close_db()  # Close database connections
-                os._exit(0)
+                try:
+                    await self.tmdb_api.close()
+                    if self.omdb_api:
+                        await self.omdb_api.close()
+                    if self.kp_api:
+                        await self.kp_api.close()
+                    if self.mdblist_api:
+                        await self.mdblist_api.close()
+                    await self.search_service.close()
+                except Exception:
+                    pass
+                
+                # Close database connections
+                try:
+                    await close_db()
+                except Exception:
+                    pass
+                
+                # Exit cleanly
+                import sys
+                sys.exit(0)
 
         page.window.on_event = on_window_event
 
@@ -299,10 +314,15 @@ class MoviePickerApp:
                 async with get_session() as session:
                     await update_entity_ratings_for_movie(session, movie.id)
             except Exception as e:
+                if is_shutting_down():
+                    return
                 # Revert on error
-                self.movie_list.update_rating(movie.id, None)
-                self._show_snackbar(f"Ошибка: {str(e)}")
-                self.page.update()
+                try:
+                    self.movie_list.update_rating(movie.id, None)
+                    self._show_snackbar(f"Ошибка: {str(e)}")
+                    self.page.update()
+                except Exception:
+                    pass  # Ignore if UI is destroyed
 
         self.page.run_task(do_save)
 
@@ -319,15 +339,24 @@ class MoviePickerApp:
                 async with get_session() as session:
                     deleted = await delete_user_rating(session, movie.id)
                     if not deleted:
-                        self._show_snackbar("Оценка не найдена")
-                        self.page.update()
+                        if not is_shutting_down():
+                            try:
+                                self._show_snackbar("Оценка не найдена")
+                                self.page.update()
+                            except Exception:
+                                pass
                         return
                 # Update entity ratings in background
                 async with get_session() as session:
                     await update_entity_ratings_for_movie(session, movie.id)
             except Exception as e:
-                self._show_snackbar(f"Ошибка: {str(e)}")
-                self.page.update()
+                if is_shutting_down():
+                    return
+                try:
+                    self._show_snackbar(f"Ошибка: {str(e)}")
+                    self.page.update()
+                except Exception:
+                    pass  # Ignore if UI is destroyed
 
         self.page.run_task(do_delete)
 
@@ -354,13 +383,18 @@ class MoviePickerApp:
                     else:
                         await remove_from_wishlist(session, movie.id)
             except Exception as e:
+                if is_shutting_down():
+                    return
                 # Revert on error
-                if add:
-                    self.movie_list.update_wishlist(movie.id, False)
-                else:
-                    self.movie_list.update_wishlist(movie.id, True)
-                self._show_snackbar(f"Ошибка: {str(e)}")
-                self.page.update()
+                try:
+                    if add:
+                        self.movie_list.update_wishlist(movie.id, False)
+                    else:
+                        self.movie_list.update_wishlist(movie.id, True)
+                    self._show_snackbar(f"Ошибка: {str(e)}")
+                    self.page.update()
+                except Exception:
+                    pass  # Ignore if UI is destroyed
 
         self.page.run_task(do_toggle)
 
@@ -463,12 +497,24 @@ class MoviePickerApp:
 
                     user_rating = await save_user_rating(session, movie.id, rating, review)
 
-                    self.movie_list.update_rating(movie.id, user_rating)
-                    self._show_snackbar("Рецензия сохранена")
+                    if not is_shutting_down():
+                        try:
+                            self.movie_list.update_rating(movie.id, user_rating)
+                            self._show_snackbar("Рецензия сохранена")
+                        except Exception:
+                            pass  # Ignore if UI is destroyed
             except Exception as e:
-                self._show_snackbar(f"Ошибка при сохранении рецензии: {str(e)}")
+                if not is_shutting_down():
+                    try:
+                        self._show_snackbar(f"Ошибка при сохранении рецензии: {str(e)}")
+                    except Exception:
+                        pass
 
-            self.page.update()
+            if not is_shutting_down():
+                try:
+                    self.page.update()
+                except Exception:
+                    pass  # Ignore if UI is destroyed
 
         self.page.run_task(do_save)
 
@@ -492,15 +538,21 @@ class MoviePickerApp:
                     if is_shutting_down():
                         return
                     # Update UI when a movie's ratings are loaded
-                    self.movie_list.update_movie_data(movie)
+                    try:
+                        self.movie_list.update_movie_data(movie)
+                    except Exception:
+                        pass  # Ignore if UI is being destroyed
 
                 await self.search_service.fetch_missing_ratings(session, movies, on_movie_updated)
         except Exception:
             pass  # Silently ignore rating fetch errors
         finally:
             if not is_shutting_down():
-                # Turn off loading indicators when done
-                self.movie_list.set_ratings_loading(False)
+                try:
+                    # Turn off loading indicators when done
+                    self.movie_list.set_ratings_loading(False)
+                except Exception:
+                    pass  # Ignore if UI is already destroyed
 
     def _show_loading(self):
         """Show loading indicator."""

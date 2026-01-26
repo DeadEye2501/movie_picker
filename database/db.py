@@ -60,9 +60,24 @@ async def close_db():
     """Close the database engine and all connections."""
     global _engine, _SessionLocal
     if _engine:
-        await _engine.dispose()
-        _engine = None
+        # Clear the session factory first
         _SessionLocal = None
+        
+        # For SQLite: checkpoint WAL to close cleanly
+        try:
+            from sqlalchemy import text
+            async with _engine.begin() as conn:
+                await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+        except Exception:
+            pass
+        
+        # Dispose the engine (closes all connections)
+        try:
+            await _engine.dispose()
+        except Exception:
+            pass
+        
+        _engine = None
 
 
 @asynccontextmanager

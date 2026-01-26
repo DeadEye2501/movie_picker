@@ -463,7 +463,7 @@ class SearchService:
 
     async def find_magic_recommendation(self, session: AsyncSession) -> Optional[Movie]:
         """Find the single best unwatched movie based on user's preferences."""
-        from database import get_rated_movies, get_all_user_ratings, get_cached_recommendations, save_cached_recommendations
+        from database import get_rated_movies, get_all_user_ratings, get_cached_recommendations, save_cached_recommendations, get_wishlist_movie_ids
 
         rated_movies = await get_rated_movies(session, min_rating=6)
         if not rated_movies:
@@ -471,6 +471,9 @@ class SearchService:
 
         all_ratings = await get_all_user_ratings(session)
         rated_ids = {(ur.movie.kinopoisk_id, ur.movie.is_tv) for ur in all_ratings}
+        
+        # Get wishlist movie IDs to exclude them from recommendations
+        wishlist_ids = await get_wishlist_movie_ids(session)
 
         seen_ids = set()
         candidates = []
@@ -523,6 +526,9 @@ class SearchService:
 
         for movie in movies:
             if (movie.kinopoisk_id, movie.is_tv) in rated_ids:
+                continue
+            # Skip movies that are in wishlist
+            if movie.id in wishlist_ids:
                 continue
             score = await self.recommender.calculate_score(movie, session)
             if score > best_score:
