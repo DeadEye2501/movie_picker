@@ -125,9 +125,9 @@ class MovieList(ft.Container):
         self._refresh()
 
     def update_rating(self, movie_id: int, rating: UserRating):
-        """Update rating for a specific movie."""
+        """Update rating for a specific movie (without full refresh)."""
         self.ratings[movie_id] = rating
-        self._refresh()
+        self._update_single_card(movie_id)
 
     def remove_rating(self, movie_id: int, remove_from_list: bool = False):
         """Remove rating for a specific movie.
@@ -145,8 +145,9 @@ class MovieList(ft.Container):
             total_pages = max(1, (len(self.movies) + self.ITEMS_PER_PAGE - 1) // self.ITEMS_PER_PAGE)
             if self.current_page >= total_pages:
                 self.current_page = max(0, total_pages - 1)
-
-        self._refresh()
+            self._refresh()  # Need full refresh when removing from list
+        else:
+            self._update_single_card(movie_id)  # Just update the one card
 
     def _refresh(self):
         """Refresh the displayed content."""
@@ -202,6 +203,24 @@ class MovieList(ft.Container):
 
         self.update()
 
+    def _update_single_card(self, movie_id: int):
+        """Update a single card without rebuilding everything."""
+        start_idx = self.current_page * self.ITEMS_PER_PAGE
+        end_idx = start_idx + self.ITEMS_PER_PAGE
+        page_movies = self.movies[start_idx:end_idx]
+
+        for i, movie in enumerate(page_movies):
+            if movie.id == movie_id and i < len(self.movies_column.controls):
+                card = self.movies_column.controls[i]
+                if isinstance(card, MovieCard):
+                    rating_obj = self.ratings.get(movie_id)
+                    card.user_rating = rating_obj.rating if rating_obj else None
+                    card.user_review = rating_obj.review if rating_obj else None
+                    card.in_wishlist = movie_id in self.wishlist_ids
+                    card.content = card._build_content()
+                    card.update()
+                break
+
     def _go_to_page(self, page: int):
         """Navigate to a specific page."""
         total_pages = max(1, (len(self.movies) + self.ITEMS_PER_PAGE - 1) // self.ITEMS_PER_PAGE)
@@ -211,12 +230,12 @@ class MovieList(ft.Container):
             self._refresh()
 
     def update_wishlist(self, movie_id: int, in_wishlist: bool):
-        """Update wishlist status for a movie."""
+        """Update wishlist status for a movie (without full refresh)."""
         if in_wishlist:
             self.wishlist_ids.add(movie_id)
         else:
             self.wishlist_ids.discard(movie_id)
-        self._refresh()
+        self._update_single_card(movie_id)
 
     def remove_from_wishlist_view(self, movie_id: int):
         """Remove movie from wishlist view (when in wishlist mode)."""

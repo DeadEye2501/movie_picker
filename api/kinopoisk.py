@@ -3,7 +3,7 @@ import httpx
 
 
 class KinopoiskAPI:
-    """Wrapper for Kinopoisk Unofficial API using httpx."""
+    """Async wrapper for Kinopoisk Unofficial API."""
 
     BASE_URL = "https://kinopoiskapiunofficial.tech/api"
 
@@ -13,24 +13,33 @@ class KinopoiskAPI:
             "X-API-KEY": api_key,
             "Content-Type": "application/json",
         }
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
-        """Make a GET request to the API."""
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create async HTTP client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=30.0, headers=self.headers)
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
+        """Make an async GET request to the API."""
         try:
-            with httpx.Client(timeout=30.0) as client:
-                response = client.get(
-                    f"{self.BASE_URL}{endpoint}",
-                    headers=self.headers,
-                    params=params,
-                )
-                response.raise_for_status()
-                return response.json()
+            client = await self._get_client()
+            response = await client.get(f"{self.BASE_URL}{endpoint}", params=params)
+            response.raise_for_status()
+            return response.json()
         except Exception:
             return None
 
-    def search_by_keyword(self, keyword: str, page: int = 1) -> list[dict]:
+    async def search_by_keyword(self, keyword: str, page: int = 1) -> list[dict]:
         """Search films by keyword."""
-        data = self._get("/v2.1/films/search-by-keyword", {"keyword": keyword, "page": page})
+        data = await self._get("/v2.1/films/search-by-keyword", {"keyword": keyword, "page": page})
 
         if not data or "films" not in data:
             return []
@@ -41,31 +50,31 @@ class KinopoiskAPI:
 
         return films
 
-    def get_film_details(self, film_id: int) -> Optional[dict]:
+    async def get_film_details(self, film_id: int) -> Optional[dict]:
         """Get detailed information about a film."""
-        data = self._get(f"/v2.2/films/{film_id}")
+        data = await self._get(f"/v2.2/films/{film_id}")
 
         if not data:
             return None
 
         return self._parse_film_details(data)
 
-    def get_staff(self, film_id: int) -> dict:
-        """Get staff information (actors, directors) for a film."""
-        data = self._get(f"/v1/staff", {"filmId": film_id})
+    async def get_staff(self, film_id: int) -> dict:
+        """Get staff information for a film."""
+        data = await self._get("/v1/staff", {"filmId": film_id})
 
         if not data:
             return {"director": None, "actors": []}
 
         return self._parse_staff(data)
 
-    def get_full_movie_info(self, film_id: int) -> Optional[dict]:
+    async def get_full_movie_info(self, film_id: int) -> Optional[dict]:
         """Get complete movie information including staff."""
-        details = self.get_film_details(film_id)
+        details = await self.get_film_details(film_id)
         if details is None:
             return None
 
-        staff = self.get_staff(film_id)
+        staff = await self.get_staff(film_id)
         details["director"] = staff["director"]
         details["actors"] = ", ".join(staff["actors"][:10])
 
@@ -108,7 +117,7 @@ class KinopoiskAPI:
         }
 
     def _parse_staff(self, staff_list: list) -> dict:
-        """Parse staff information to extract director and actors."""
+        """Parse staff information."""
         director = None
         actors = []
 

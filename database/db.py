@@ -1,23 +1,25 @@
 import os
-from contextlib import contextmanager
-from typing import Optional, Generator
-from sqlalchemy import create_engine, func, or_
-from sqlalchemy.orm import sessionmaker, Session
-
 import json
+from contextlib import asynccontextmanager
+from typing import Optional, AsyncGenerator
 from datetime import timedelta, timezone
+
+from sqlalchemy import func, or_, select, delete
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import selectinload
+
 from .models import (
     Base, Movie, UserRating, Genre, Director, Actor,
     MovieGenre, MovieDirector, MovieActor,
     Wishlist, RecommendationCache, utc_now
 )
-from .genre_utils import GENRE_SEED_DATA, normalize_genres, init_genre_cache, clear_cache
+from .genre_utils import GENRE_SEED_DATA, init_genre_cache_async, clear_cache
 
 _engine = None
 _SessionLocal = None
 
 
-def init_db(db_path: str = "movie_picker.db"):
+async def init_db(db_path: str = "movie_picker.db"):
     """Initialize the database and create tables."""
     global _engine, _SessionLocal
 
@@ -25,21 +27,23 @@ def init_db(db_path: str = "movie_picker.db"):
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir)
 
-    _engine = create_engine(f"sqlite:///{db_path}", echo=False)
-    Base.metadata.create_all(_engine)
-    _SessionLocal = sessionmaker(bind=_engine)
+    _engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    _SessionLocal = async_sessionmaker(bind=_engine, expire_on_commit=False)
 
     # Seed genres if empty and initialize cache
-    session = _SessionLocal()
-    try:
-        if session.query(Genre).count() == 0:
-            _seed_genres(session)
-        init_genre_cache(session)
-    finally:
-        session.close()
+    async with _SessionLocal() as session:
+        result = await session.execute(select(func.count(Genre.id)))
+        count = result.scalar()
+        if count == 0:
+            await _seed_genres(session)
+        await init_genre_cache_async(session)
 
 
-def _seed_genres(session: Session):
+async def _seed_genres(session: AsyncSession):
     """Seed the genres table with canonical genre data."""
     for name, aliases, tmdb_movie_id, tmdb_tv_id in GENRE_SEED_DATA:
         genre = Genre(
@@ -49,43 +53,42 @@ def _seed_genres(session: Session):
             tmdb_tv_id=tmdb_tv_id,
         )
         session.add(genre)
-    session.commit()
+    await session.commit()
 
 
-def close_db():
+async def close_db():
     """Close the database engine and all connections."""
     global _engine, _SessionLocal
     if _engine:
-        _engine.dispose()
+        await _engine.dispose()
         _engine = None
         _SessionLocal = None
 
 
-@contextmanager
-def get_session() -> Generator[Session, None, None]:
-    """Get a database session as context manager."""
+@asynccontextmanager
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Get a database session as async context manager."""
     if _SessionLocal is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
-    session = _SessionLocal(expire_on_commit=False)
-    try:
+    async with _SessionLocal() as session:
         yield session
-    finally:
-        session.close()
 
 
 # =============================================================================
 # Movie CRUD
 # =============================================================================
 
-def get_movie_by_kp_id(session: Session, kinopoisk_id: int, is_tv: bool = False) -> Optional[Movie]:
+async def get_movie_by_kp_id(session: AsyncSession, kinopoisk_id: int, is_tv: bool = False) -> Optional[Movie]:
     """Get a movie/TV show by its TMDB ID and type."""
-    return session.query(Movie).filter(
-        Movie.kinopoisk_id == kinopoisk_id,
-        Movie.is_tv == is_tv
-    ).first()
+    result = await session.execute(
+        select(Movie)
+        .options(selectinload(Movie.genre_list), selectinload(Movie.director_list), selectinload(Movie.actor_list))
+        .filter(Movie.kinopoisk_id == kinopoisk_id, Movie.is_tv == is_tv)
+    )
+    return result.scalar_one_or_none()
 
 
-def save_movie(session: Session, movie_data: dict) -> Movie:
+async def save_movie(session: AsyncSession, movie_data: dict) -> Movie:
     """Save or update a movie/TV show in the database.
 
     Handles M2M relationships for genres, directors, and actors.
@@ -96,7 +99,7 @@ def save_movie(session: Session, movie_data: dict) -> Movie:
     """
     is_tv = movie_data.get("is_tv", False)
     kinopoisk_id = movie_data["kinopoisk_id"]
-    movie = get_movie_by_kp_id(session, kinopoisk_id, is_tv)
+    movie = await get_movie_by_kp_id(session, kinopoisk_id, is_tv)
 
     # Extract M2M data
     genres_string = movie_data.pop("genres", None)
@@ -107,7 +110,7 @@ def save_movie(session: Session, movie_data: dict) -> Movie:
         if movie is None:
             movie = Movie(**movie_data)
             session.add(movie)
-            session.flush()  # Get movie.id before setting M2M
+            await session.flush()
         else:
             for key, value in movie_data.items():
                 if hasattr(movie, key) and key != "id":
@@ -115,18 +118,17 @@ def save_movie(session: Session, movie_data: dict) -> Movie:
 
         # Set M2M relationships
         if genres_string is not None:
-            set_movie_genres(session, movie, genres_string)
+            await set_movie_genres(session, movie, genres_string)
         if directors_list is not None:
-            set_movie_directors(session, movie, directors_list)
+            await set_movie_directors(session, movie, directors_list)
         if actors_list is not None:
-            set_movie_actors(session, movie, actors_list)
+            await set_movie_actors(session, movie, actors_list)
 
-        session.commit()
-        session.refresh(movie)
+        await session.commit()
+        await session.refresh(movie, ["genre_list", "director_list", "actor_list"])
     except Exception:
-        session.rollback()
-        # Re-fetch movie after rollback if it existed
-        movie = get_movie_by_kp_id(session, kinopoisk_id, is_tv)
+        await session.rollback()
+        movie = await get_movie_by_kp_id(session, kinopoisk_id, is_tv)
         if movie is None:
             raise
 
@@ -137,14 +139,15 @@ def save_movie(session: Session, movie_data: dict) -> Movie:
 # M2M Setters
 # =============================================================================
 
-def set_movie_genres(session: Session, movie: Movie, genres_string: str):
+async def set_movie_genres(session: AsyncSession, movie: Movie, genres_string: str):
     """Set movie genres from a comma-separated string."""
-    session.query(MovieGenre).filter(MovieGenre.movie_id == movie.id).delete()
+    await session.execute(delete(MovieGenre).filter(MovieGenre.movie_id == movie.id))
 
     if not genres_string:
         return
 
-    genre_ids = normalize_genres(genres_string, session)
+    from .genre_utils import normalize_genres_async
+    genre_ids = await normalize_genres_async(genres_string, session)
     seen_genre_ids = set()
     for genre_id in genre_ids:
         if genre_id not in seen_genre_ids:
@@ -152,31 +155,30 @@ def set_movie_genres(session: Session, movie: Movie, genres_string: str):
             session.add(MovieGenre(movie_id=movie.id, genre_id=genre_id))
 
 
-def set_movie_directors(session: Session, movie: Movie, directors: list[dict]):
+async def set_movie_directors(session: AsyncSession, movie: Movie, directors: list[dict]):
     """Set movie directors from a list of dicts with tmdb_id and name."""
-    session.query(MovieDirector).filter(MovieDirector.movie_id == movie.id).delete()
+    await session.execute(delete(MovieDirector).filter(MovieDirector.movie_id == movie.id))
 
     if not directors:
         return
 
     seen_tmdb_ids = set()
-
     for d in directors:
         tmdb_id = d.get("tmdb_id")
-        name = d.get("name")
+        name = d.get("name", "").strip()
         if not tmdb_id or not name:
             continue
         if tmdb_id in seen_tmdb_ids:
             continue
         seen_tmdb_ids.add(tmdb_id)
 
-        director = get_or_create_director(session, tmdb_id, name)
+        director = await get_or_create_director(session, tmdb_id, name)
         session.add(MovieDirector(movie_id=movie.id, director_id=director.id))
 
 
-def set_movie_actors(session: Session, movie: Movie, actors: list[dict], limit: int = 10):
+async def set_movie_actors(session: AsyncSession, movie: Movie, actors: list[dict], limit: int = 10):
     """Set movie actors from a list of dicts with tmdb_id and name."""
-    session.query(MovieActor).filter(MovieActor.movie_id == movie.id).delete()
+    await session.execute(delete(MovieActor).filter(MovieActor.movie_id == movie.id))
 
     if not actors:
         return
@@ -186,14 +188,14 @@ def set_movie_actors(session: Session, movie: Movie, actors: list[dict], limit: 
 
     for a in actors[:limit]:
         tmdb_id = a.get("tmdb_id")
-        name = a.get("name")
+        name = a.get("name", "").strip()
         if not tmdb_id or not name:
             continue
         if tmdb_id in seen_tmdb_ids:
             continue
         seen_tmdb_ids.add(tmdb_id)
 
-        actor = get_or_create_actor(session, tmdb_id, name)
+        actor = await get_or_create_actor(session, tmdb_id, name)
         session.add(MovieActor(movie_id=movie.id, actor_id=actor.id, order=order))
         order += 1
 
@@ -202,59 +204,67 @@ def set_movie_actors(session: Session, movie: Movie, actors: list[dict], limit: 
 # Entity Getters/Creators
 # =============================================================================
 
-def get_or_create_director(session: Session, tmdb_id: int, name: str) -> Director:
+async def get_or_create_director(session: AsyncSession, tmdb_id: int, name: str) -> Director:
     """Get existing director by TMDB ID or create new one."""
-    director = session.query(Director).filter(Director.tmdb_id == tmdb_id).first()
+    result = await session.execute(select(Director).filter(Director.tmdb_id == tmdb_id))
+    director = result.scalar_one_or_none()
     if director is None:
         director = Director(tmdb_id=tmdb_id, name=name)
         session.add(director)
-        session.flush()
+        await session.flush()
     elif director.name != name:
-        # Update name if changed (e.g., different localization)
         director.name = name
     return director
 
 
-def get_or_create_actor(session: Session, tmdb_id: int, name: str) -> Actor:
+async def get_or_create_actor(session: AsyncSession, tmdb_id: int, name: str) -> Actor:
     """Get existing actor by TMDB ID or create new one."""
-    actor = session.query(Actor).filter(Actor.tmdb_id == tmdb_id).first()
+    result = await session.execute(select(Actor).filter(Actor.tmdb_id == tmdb_id))
+    actor = result.scalar_one_or_none()
     if actor is None:
         actor = Actor(tmdb_id=tmdb_id, name=name)
         session.add(actor)
-        session.flush()
+        await session.flush()
     elif actor.name != name:
-        # Update name if changed (e.g., different localization)
         actor.name = name
     return actor
 
 
-def get_genre_by_id(session: Session, genre_id: int) -> Optional[Genre]:
+async def get_genre_by_id(session: AsyncSession, genre_id: int) -> Optional[Genre]:
     """Get genre by ID."""
-    return session.query(Genre).filter(Genre.id == genre_id).first()
+    result = await session.execute(select(Genre).filter(Genre.id == genre_id))
+    return result.scalar_one_or_none()
 
 
-def get_director_by_id(session: Session, director_id: int) -> Optional[Director]:
+async def get_director_by_id(session: AsyncSession, director_id: int) -> Optional[Director]:
     """Get director by ID."""
-    return session.query(Director).filter(Director.id == director_id).first()
+    result = await session.execute(select(Director).filter(Director.id == director_id))
+    return result.scalar_one_or_none()
 
 
-def get_actor_by_id(session: Session, actor_id: int) -> Optional[Actor]:
+async def get_actor_by_id(session: AsyncSession, actor_id: int) -> Optional[Actor]:
     """Get actor by ID."""
-    return session.query(Actor).filter(Actor.id == actor_id).first()
+    result = await session.execute(select(Actor).filter(Actor.id == actor_id))
+    return result.scalar_one_or_none()
 
 
 # =============================================================================
 # User Ratings
 # =============================================================================
 
-def get_user_rating(session: Session, movie_id: int) -> Optional[UserRating]:
+async def get_user_rating(session: AsyncSession, movie_id: int) -> Optional[UserRating]:
     """Get user rating for a movie."""
-    return session.query(UserRating).filter(UserRating.movie_id == movie_id).first()
+    result = await session.execute(
+        select(UserRating)
+        .options(selectinload(UserRating.movie).selectinload(Movie.genre_list))
+        .filter(UserRating.movie_id == movie_id)
+    )
+    return result.scalar_one_or_none()
 
 
-def save_user_rating(session: Session, movie_id: int, rating: int, review: Optional[str] = None) -> UserRating:
-    """Save or update user rating for a movie."""
-    user_rating = get_user_rating(session, movie_id)
+async def save_user_rating(session: AsyncSession, movie_id: int, rating: int, review: Optional[str] = None) -> UserRating:
+    """Save or update user rating for a movie (fast, no entity recalc)."""
+    user_rating = await get_user_rating(session, movie_id)
 
     if user_rating is None:
         user_rating = UserRating(movie_id=movie_id, rating=rating, review=review)
@@ -264,63 +274,78 @@ def save_user_rating(session: Session, movie_id: int, rating: int, review: Optio
         if review is not None:
             user_rating.review = review
 
-    # Remove from wishlist if present (watched = no longer "want to watch")
-    wishlist_item = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    # Remove from wishlist if present
+    result = await session.execute(select(Wishlist).filter(Wishlist.movie_id == movie_id))
+    wishlist_item = result.scalar_one_or_none()
     if wishlist_item:
-        session.delete(wishlist_item)
+        await session.delete(wishlist_item)
 
-    session.commit()
-    session.refresh(user_rating)
-
-    # Update entity ratings (genres, directors, actors)
-    movie = session.get(Movie, movie_id)
-    if movie:
-        update_entity_ratings(session, movie)
-        session.commit()
-
+    await session.commit()
+    await session.refresh(user_rating)
     return user_rating
 
 
-def delete_user_rating(session: Session, movie_id: int) -> bool:
-    """Delete user rating for a movie and recalculate entity ratings."""
-    user_rating = get_user_rating(session, movie_id)
+async def delete_user_rating(session: AsyncSession, movie_id: int) -> bool:
+    """Delete user rating for a movie (fast, no entity recalc)."""
+    user_rating = await get_user_rating(session, movie_id)
     if user_rating is None:
         return False
 
-    movie = session.get(Movie, movie_id)
-    session.delete(user_rating)
-    session.commit()
-
-    if movie:
-        update_entity_ratings(session, movie)
-        session.commit()
-
+    await session.delete(user_rating)
+    await session.commit()
     return True
 
 
-def get_all_user_ratings(session: Session) -> list[UserRating]:
+async def update_entity_ratings_for_movie(session: AsyncSession, movie_id: int):
+    """Update entity ratings for a movie (can be called in background)."""
+    movie = await session.get(Movie, movie_id, options=[
+        selectinload(Movie.genre_list),
+        selectinload(Movie.director_list),
+        selectinload(Movie.actor_list),
+    ])
+    if movie:
+        await update_entity_ratings(session, movie)
+        await session.commit()
+
+
+async def get_all_user_ratings(session: AsyncSession) -> list[UserRating]:
     """Get all user ratings with their associated movies."""
-    return session.query(UserRating).all()
+    result = await session.execute(
+        select(UserRating)
+        .options(
+            selectinload(UserRating.movie)
+            .selectinload(Movie.genre_list)
+        )
+    )
+    return list(result.unique().scalars().all())
 
 
-def get_all_user_ratings_filtered(
-    session: Session,
+async def get_all_user_ratings_filtered(
+    session: AsyncSession,
     sort_by: str = "date_desc",
     min_rating: Optional[int] = None,
     max_rating: Optional[int] = None,
     genres: Optional[list[str]] = None,
 ) -> list[UserRating]:
     """Get user ratings with sorting and filtering."""
-    query = session.query(UserRating).join(Movie)
+    query = (
+        select(UserRating)
+        .join(Movie)
+        .options(
+            selectinload(UserRating.movie)
+            .selectinload(Movie.genre_list)
+        )
+    )
 
     if min_rating is not None:
         query = query.filter(UserRating.rating >= min_rating)
     if max_rating is not None:
         query = query.filter(UserRating.rating <= max_rating)
 
-    user_ratings = query.all()
+    result = await session.execute(query)
+    user_ratings = list(result.unique().scalars().all())
 
-    # Apply genre filter using M2M relationship
+    # Apply genre filter
     if genres:
         genres_lower = [g.lower() for g in genres]
         filtered = []
@@ -348,132 +373,159 @@ def get_all_user_ratings_filtered(
     return user_ratings
 
 
-def get_rated_movies(session: Session, min_rating: Optional[int] = None) -> list[Movie]:
+async def get_rated_movies(session: AsyncSession, min_rating: Optional[int] = None) -> list[Movie]:
     """Get all movies that have user ratings."""
-    query = session.query(Movie).join(UserRating)
+    query = (
+        select(Movie)
+        .join(UserRating)
+        .options(
+            selectinload(Movie.genre_list),
+            selectinload(Movie.director_list),
+            selectinload(Movie.actor_list),
+            selectinload(Movie.user_rating),
+        )
+    )
     if min_rating is not None:
         query = query.filter(UserRating.rating >= min_rating)
-    return query.all()
+    result = await session.execute(query)
+    return list(result.unique().scalars().all())
 
 
 # =============================================================================
 # Entity Rating Calculations
 # =============================================================================
 
-def update_entity_ratings(session: Session, movie: Movie):
-    """Update ratings for all entities (genres, directors, actors) related to a movie."""
-    # Update genres
-    for genre in movie.genre_list:
-        _recalculate_genre_rating(session, genre)
+async def update_entity_ratings(session: AsyncSession, movie: Movie):
+    """Update ratings for all entities related to a movie using batch queries."""
+    # Batch update genres (single query for all genre IDs)
+    genre_ids = [g.id for g in movie.genre_list]
+    if genre_ids:
+        result = await session.execute(
+            select(
+                MovieGenre.genre_id,
+                func.avg(UserRating.rating).label('avg_rating'),
+                func.count(UserRating.id).label('rating_count')
+            )
+            .join(Movie, MovieGenre.movie_id == Movie.id)
+            .join(UserRating, UserRating.movie_id == Movie.id)
+            .filter(MovieGenre.genre_id.in_(genre_ids))
+            .group_by(MovieGenre.genre_id)
+        )
+        genre_stats = {row.genre_id: (row.avg_rating, row.rating_count) for row in result.all()}
+        for genre in movie.genre_list:
+            if genre.id in genre_stats:
+                genre.avg_rating, genre.rating_count = genre_stats[genre.id]
+            else:
+                genre.avg_rating, genre.rating_count = None, 0
 
-    # Update directors
-    for director in movie.director_list:
-        _recalculate_director_rating(session, director)
+    # Batch update directors
+    director_ids = [d.id for d in movie.director_list]
+    if director_ids:
+        result = await session.execute(
+            select(
+                MovieDirector.director_id,
+                func.avg(UserRating.rating).label('avg_rating'),
+                func.count(UserRating.id).label('rating_count')
+            )
+            .join(Movie, MovieDirector.movie_id == Movie.id)
+            .join(UserRating, UserRating.movie_id == Movie.id)
+            .filter(MovieDirector.director_id.in_(director_ids))
+            .group_by(MovieDirector.director_id)
+        )
+        director_stats = {row.director_id: (row.avg_rating, row.rating_count) for row in result.all()}
+        for director in movie.director_list:
+            if director.id in director_stats:
+                director.avg_rating, director.rating_count = director_stats[director.id]
+            else:
+                director.avg_rating, director.rating_count = None, 0
 
-    # Update actors
-    for actor in movie.actor_list:
-        _recalculate_actor_rating(session, actor)
-
-
-def _recalculate_genre_rating(session: Session, genre: Genre):
-    """Recalculate average rating for a genre."""
-    # Get all rated movies with this genre
-    rated_movies = session.query(Movie).join(UserRating).join(MovieGenre).filter(
-        MovieGenre.genre_id == genre.id
-    ).all()
-
-    if not rated_movies:
-        genre.avg_rating = None
-        genre.rating_count = 0
-    else:
-        total = sum(m.user_rating.rating for m in rated_movies)
-        genre.avg_rating = total / len(rated_movies)
-        genre.rating_count = len(rated_movies)
-
-
-def _recalculate_director_rating(session: Session, director: Director):
-    """Recalculate average rating for a director."""
-    rated_movies = session.query(Movie).join(UserRating).join(MovieDirector).filter(
-        MovieDirector.director_id == director.id
-    ).all()
-
-    if not rated_movies:
-        director.avg_rating = None
-        director.rating_count = 0
-    else:
-        total = sum(m.user_rating.rating for m in rated_movies)
-        director.avg_rating = total / len(rated_movies)
-        director.rating_count = len(rated_movies)
-
-
-def _recalculate_actor_rating(session: Session, actor: Actor):
-    """Recalculate average rating for an actor."""
-    rated_movies = session.query(Movie).join(UserRating).join(MovieActor).filter(
-        MovieActor.actor_id == actor.id
-    ).all()
-
-    if not rated_movies:
-        actor.avg_rating = None
-        actor.rating_count = 0
-    else:
-        total = sum(m.user_rating.rating for m in rated_movies)
-        actor.avg_rating = total / len(rated_movies)
-        actor.rating_count = len(rated_movies)
+    # Batch update actors
+    actor_ids = [a.id for a in movie.actor_list]
+    if actor_ids:
+        result = await session.execute(
+            select(
+                MovieActor.actor_id,
+                func.avg(UserRating.rating).label('avg_rating'),
+                func.count(UserRating.id).label('rating_count')
+            )
+            .join(Movie, MovieActor.movie_id == Movie.id)
+            .join(UserRating, UserRating.movie_id == Movie.id)
+            .filter(MovieActor.actor_id.in_(actor_ids))
+            .group_by(MovieActor.actor_id)
+        )
+        actor_stats = {row.actor_id: (row.avg_rating, row.rating_count) for row in result.all()}
+        for actor in movie.actor_list:
+            if actor.id in actor_stats:
+                actor.avg_rating, actor.rating_count = actor_stats[actor.id]
+            else:
+                actor.avg_rating, actor.rating_count = None, 0
 
 
 # =============================================================================
 # Search
 # =============================================================================
 
-def search_local_movies(session: Session, query: str) -> list[Movie]:
-    """Search movies in local database by title, description, genres, directors, or actors."""
+async def search_local_movies(session: AsyncSession, query: str) -> list[Movie]:
+    """Search movies in local database using a single optimized query."""
     search_term = f"%{query.lower()}%"
 
-    # Search in movie fields
-    movies_by_fields = session.query(Movie).filter(
-        or_(
+    # Use subqueries to find matching movie IDs from all sources
+    # Then load movies with all relationships in a single query
+
+    # Subquery for movies matching by fields
+    fields_subq = (
+        select(Movie.id)
+        .filter(or_(
             func.lower(Movie.title).like(search_term),
             func.lower(Movie.title_original).like(search_term),
             func.lower(Movie.description).like(search_term),
-        )
-    ).all()
+        ))
+    )
 
-    # Search by genre name
-    movies_by_genre = session.query(Movie).join(MovieGenre).join(Genre).filter(
-        func.lower(Genre.name).like(search_term)
-    ).all()
+    # Subquery for movies matching by genre
+    genre_subq = (
+        select(Movie.id)
+        .join(MovieGenre).join(Genre)
+        .filter(func.lower(Genre.name).like(search_term))
+    )
 
-    # Search by director name
-    movies_by_director = session.query(Movie).join(MovieDirector).join(Director).filter(
-        func.lower(Director.name).like(search_term)
-    ).all()
+    # Subquery for movies matching by director
+    director_subq = (
+        select(Movie.id)
+        .join(MovieDirector).join(Director)
+        .filter(func.lower(Director.name).like(search_term))
+    )
 
-    # Search by actor name
-    movies_by_actor = session.query(Movie).join(MovieActor).join(Actor).filter(
-        func.lower(Actor.name).like(search_term)
-    ).all()
+    # Subquery for movies matching by actor
+    actor_subq = (
+        select(Movie.id)
+        .join(MovieActor).join(Actor)
+        .filter(func.lower(Actor.name).like(search_term))
+    )
 
-    # Combine results (unique movies)
-    movie_ids = set()
-    result = []
-    for movie in movies_by_fields + movies_by_genre + movies_by_director + movies_by_actor:
-        if movie.id not in movie_ids:
-            movie_ids.add(movie.id)
-            result.append(movie)
+    # Combine all matching IDs with UNION and fetch movies with relationships
+    combined_ids = fields_subq.union(genre_subq, director_subq, actor_subq).subquery()
 
-    return result
+    result = await session.execute(
+        select(Movie)
+        .options(selectinload(Movie.genre_list), selectinload(Movie.director_list), selectinload(Movie.actor_list))
+        .filter(Movie.id.in_(select(combined_ids.c.id)))
+    )
+
+    return list(result.unique().scalars().all())
 
 
 # =============================================================================
 # Recommendations Cache
 # =============================================================================
 
-def get_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, max_age_days: int = 7) -> Optional[list[int]]:
-    """Get cached TMDB recommendations. Returns None if not cached or expired."""
-    cache = session.query(RecommendationCache).filter(
-        RecommendationCache.source_tmdb_id == tmdb_id,
-        RecommendationCache.source_is_tv == is_tv
-    ).first()
+async def get_cached_recommendations(session: AsyncSession, tmdb_id: int, is_tv: bool, max_age_days: int = 7) -> Optional[list[int]]:
+    """Get cached TMDB recommendations."""
+    result = await session.execute(
+        select(RecommendationCache)
+        .filter(RecommendationCache.source_tmdb_id == tmdb_id, RecommendationCache.source_is_tv == is_tv)
+    )
+    cache = result.scalar_one_or_none()
 
     if cache is None:
         return None
@@ -487,12 +539,13 @@ def get_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, max_
     return []
 
 
-def save_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, recommended_ids: list[int]):
+async def save_cached_recommendations(session: AsyncSession, tmdb_id: int, is_tv: bool, recommended_ids: list[int]):
     """Save TMDB recommendations to cache."""
-    cache = session.query(RecommendationCache).filter(
-        RecommendationCache.source_tmdb_id == tmdb_id,
-        RecommendationCache.source_is_tv == is_tv
-    ).first()
+    result = await session.execute(
+        select(RecommendationCache)
+        .filter(RecommendationCache.source_tmdb_id == tmdb_id, RecommendationCache.source_is_tv == is_tv)
+    )
+    cache = result.scalar_one_or_none()
 
     if cache is None:
         cache = RecommendationCache(
@@ -506,47 +559,58 @@ def save_cached_recommendations(session: Session, tmdb_id: int, is_tv: bool, rec
         cache.recommended_ids = json.dumps(recommended_ids)
         cache.updated_at = utc_now()
 
-    session.commit()
+    await session.commit()
 
 
 # =============================================================================
 # Wishlist
 # =============================================================================
 
-def is_in_wishlist(session: Session, movie_id: int) -> bool:
+async def is_in_wishlist(session: AsyncSession, movie_id: int) -> bool:
     """Check if movie is in wishlist."""
-    return session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first() is not None
+    result = await session.execute(select(Wishlist).filter(Wishlist.movie_id == movie_id))
+    return result.scalar_one_or_none() is not None
 
 
-def add_to_wishlist(session: Session, movie_id: int) -> Wishlist:
+async def add_to_wishlist(session: AsyncSession, movie_id: int) -> Wishlist:
     """Add movie to wishlist."""
-    existing = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    result = await session.execute(select(Wishlist).filter(Wishlist.movie_id == movie_id))
+    existing = result.scalar_one_or_none()
     if existing:
         return existing
 
     wishlist_item = Wishlist(movie_id=movie_id)
     session.add(wishlist_item)
-    session.commit()
-    session.refresh(wishlist_item)
+    await session.commit()
+    await session.refresh(wishlist_item)
     return wishlist_item
 
 
-def remove_from_wishlist(session: Session, movie_id: int) -> bool:
+async def remove_from_wishlist(session: AsyncSession, movie_id: int) -> bool:
     """Remove movie from wishlist."""
-    item = session.query(Wishlist).filter(Wishlist.movie_id == movie_id).first()
+    result = await session.execute(select(Wishlist).filter(Wishlist.movie_id == movie_id))
+    item = result.scalar_one_or_none()
     if item:
-        session.delete(item)
-        session.commit()
+        await session.delete(item)
+        await session.commit()
         return True
     return False
 
 
-def get_wishlist(session: Session) -> list[Wishlist]:
+async def get_wishlist(session: AsyncSession) -> list[Wishlist]:
     """Get all wishlist items ordered by added date (newest first)."""
-    return session.query(Wishlist).order_by(Wishlist.added_at.desc()).all()
+    result = await session.execute(
+        select(Wishlist)
+        .options(
+            selectinload(Wishlist.movie)
+            .selectinload(Movie.genre_list)
+        )
+        .order_by(Wishlist.added_at.desc())
+    )
+    return list(result.unique().scalars().all())
 
 
-def get_wishlist_movie_ids(session: Session) -> set[int]:
+async def get_wishlist_movie_ids(session: AsyncSession) -> set[int]:
     """Get set of movie IDs in wishlist (for quick lookup)."""
-    items = session.query(Wishlist.movie_id).all()
-    return {item[0] for item in items}
+    result = await session.execute(select(Wishlist.movie_id))
+    return {row[0] for row in result.all()}

@@ -47,7 +47,7 @@ def load_config() -> dict:
     }
 
 
-def main(page: ft.Page):
+async def main(page: ft.Page):
     """Main entry point."""
     config = load_config()
     app_dir = get_app_dir()
@@ -60,8 +60,8 @@ def main(page: ft.Page):
         mdblist_api_key=config.get("mdblist_api_key"),
         db_path=db_path,
     )
-    app.build(page)
+    await app.build(page)
 
 
 if __name__ == "__main__":
-    ft.app(main)
+    ft.app(target=main)

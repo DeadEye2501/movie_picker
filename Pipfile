@@ -6,7 +6,8 @@ name = "pypi"
 [packages]
 flet = "*"
 httpx = "*"
-sqlalchemy = "*"
+sqlalchemy = {extras = ["asyncio"], version = "*"}
+aiosqlite = "*"
 python-dotenv = "*"
 pyinstaller = "*"
 

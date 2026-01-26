@@ -3,22 +3,35 @@ import httpx
 
 
 class OMDBAPI:
-    """Wrapper for OMDB API to get IMDB, Rotten Tomatoes, Metacritic ratings."""
+    """Async wrapper for OMDB API to get IMDB, Rotten Tomatoes, Metacritic ratings."""
 
     BASE_URL = "https://www.omdbapi.com"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self._client = httpx.Client(timeout=10.0)
+        self._client: Optional[httpx.AsyncClient] = None
         self._disabled = False
 
-    def get_ratings_by_imdb_id(self, imdb_id: str) -> dict:
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create async HTTP client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=10.0)
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def get_ratings_by_imdb_id(self, imdb_id: str) -> dict:
         """Get ratings from OMDB by IMDB ID."""
         if not imdb_id or self._disabled:
             return {}
 
         try:
-            response = self._client.get(
+            client = await self._get_client()
+            response = await client.get(
                 self.BASE_URL,
                 params={"i": imdb_id, "apikey": self.api_key},
             )
@@ -28,20 +41,15 @@ class OMDBAPI:
             if data.get("Response") == "False":
                 error = data.get("Error", "Unknown error")
                 if "limit" in error.lower():
-                    print("[OMDB] API limit reached - disabling for this session")
                     self._disabled = True
                 return {}
 
             return self._parse_ratings(data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
-                print(f"[OMDB] Auth error ({e.response.status_code}) - disabling for this session")
                 self._disabled = True
-            else:
-                print(f"[OMDB] HTTP error: {e.response.status_code}")
             return {}
-        except Exception as e:
-            print(f"[OMDB] Error: {e}")
+        except Exception:
             return {}
 
     def _parse_ratings(self, data: dict) -> dict:

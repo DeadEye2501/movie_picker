@@ -1,5 +1,6 @@
 from typing import Optional
-from sqlalchemy.orm import Session
+from collections import OrderedDict
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import Movie
 from database import (
@@ -7,6 +8,34 @@ from database import (
     get_cached_recommendations, save_cached_recommendations
 )
 from api import TMDBAPI
+
+
+class LRUCache:
+    """Simple LRU cache with max size."""
+
+    def __init__(self, max_size: int = 100):
+        self.max_size = max_size
+        self._cache: OrderedDict = OrderedDict()
+
+    def get(self, key):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def set(self, key, value):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self.max_size:
+                self._cache.popitem(last=False)
+        self._cache[key] = value
+
+    def __contains__(self, key):
+        return key in self._cache
+
+    def clear(self):
+        self._cache.clear()
 
 
 class RecommenderService:
@@ -20,19 +49,20 @@ class RecommenderService:
     WEIGHT_AGGREGATORS = 0.2
 
     # Limits
-    MAX_RATED_MOVIES_FOR_SIMILARITY = 30  # Only consider top N rated movies
+    MAX_RATED_MOVIES_FOR_SIMILARITY = 30
+    MAX_CACHE_SIZE = 200  # Limit in-memory cache
 
     def __init__(self, tmdb_api: TMDBAPI):
         self.tmdb_api = tmdb_api
-        # In-memory cache for current session (backed by DB)
-        self._memory_cache: dict[tuple[int, bool], list[int]] = {}
+        # In-memory LRU cache for current session (backed by DB)
+        self._memory_cache = LRUCache(max_size=self.MAX_CACHE_SIZE)
 
-    def calculate_score(self, movie: Movie, session: Session) -> float:
+    async def calculate_score(self, movie: Movie, session: AsyncSession) -> float:
         """Calculate personal score for a movie based on user preferences."""
         score = 0.0
 
         # 1. TMDB similarity score (main factor)
-        score += self.WEIGHT_TMDB_SIMILARITY * self._tmdb_similarity_score(movie, session)
+        score += self.WEIGHT_TMDB_SIMILARITY * await self._tmdb_similarity_score(movie, session)
 
         # 2. Director rating (from M2M relationship)
         if movie.director_list:
@@ -70,9 +100,9 @@ class RecommenderService:
 
         return score
 
-    def _tmdb_similarity_score(self, movie: Movie, session: Session) -> float:
+    async def _tmdb_similarity_score(self, movie: Movie, session: AsyncSession) -> float:
         """Calculate score based on TMDB recommendations from rated movies."""
-        user_ratings = get_all_user_ratings(session)
+        user_ratings = await get_all_user_ratings(session)
         if not user_ratings:
             return 0.0
 
@@ -98,7 +128,7 @@ class RecommenderService:
             weight = ur.rating - 5  # Range: -4 to +5
 
             # Get recommendations for this rated movie (uses DB cache)
-            rec_ids = self._get_cached_recommendations(session, rated_movie.kinopoisk_id, rated_movie.is_tv)
+            rec_ids = await self._get_cached_recommendations(session, rated_movie.kinopoisk_id, rated_movie.is_tv)
 
             # Check if our movie is in the recommendations
             for i, rec_id in enumerate(rec_ids):
@@ -110,32 +140,33 @@ class RecommenderService:
 
         return total_score
 
-    def _get_cached_recommendations(self, session: Session, tmdb_id: int, is_tv: bool) -> list[int]:
+    async def _get_cached_recommendations(self, session: AsyncSession, tmdb_id: int, is_tv: bool) -> list[int]:
         """Get TMDB recommendations with DB caching."""
         cache_key = (tmdb_id, is_tv)
 
-        # Check memory cache first
-        if cache_key in self._memory_cache:
-            return self._memory_cache[cache_key]
+        # Check memory cache first (LRU)
+        cached_mem = self._memory_cache.get(cache_key)
+        if cached_mem is not None:
+            return cached_mem
 
         # Check DB cache
-        cached = get_cached_recommendations(session, tmdb_id, is_tv)
+        cached = await get_cached_recommendations(session, tmdb_id, is_tv)
         if cached is not None:
-            self._memory_cache[cache_key] = cached
+            self._memory_cache.set(cache_key, cached)
             return cached
 
         # Fetch from API
         if is_tv:
-            recs = self.tmdb_api.get_recommendations_tv(tmdb_id)
+            recs = await self.tmdb_api.get_recommendations_tv(tmdb_id)
         else:
-            recs = self.tmdb_api.get_recommendations_movie(tmdb_id)
+            recs = await self.tmdb_api.get_recommendations_movie(tmdb_id)
 
         # Extract IDs
         rec_ids = [r.get('kinopoisk_id') for r in recs if r.get('kinopoisk_id')]
 
         # Save to DB cache
-        save_cached_recommendations(session, tmdb_id, is_tv, rec_ids)
-        self._memory_cache[cache_key] = rec_ids
+        await save_cached_recommendations(session, tmdb_id, is_tv, rec_ids)
+        self._memory_cache.set(cache_key, rec_ids)
 
         return rec_ids
 
@@ -165,7 +196,7 @@ class RecommenderService:
         """Clear the recommendations cache."""
         self._memory_cache.clear()
 
-    def has_user_ratings(self, session: Session) -> bool:
+    async def has_user_ratings(self, session: AsyncSession) -> bool:
         """Check if user has any rated movies."""
-        user_ratings = get_all_user_ratings(session)
+        user_ratings = await get_all_user_ratings(session)
         return len(user_ratings) > 0

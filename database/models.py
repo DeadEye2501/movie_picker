@@ -103,7 +103,7 @@ class Actor(Base):
 class Movie(Base):
     __tablename__ = "movies"
     __table_args__ = (
-        UniqueConstraint('kinopoisk_id', 'is_tv', name='uq_tmdb_id_type'),
+        UniqueConstraint('kinopoisk_id', 'is_tv', name='uq_kp_id_type'),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

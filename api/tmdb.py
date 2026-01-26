@@ -1,10 +1,10 @@
+import asyncio
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 
 
 class TMDBAPI:
-    """Wrapper for The Movie Database (TMDB) API."""
+    """Async wrapper for The Movie Database (TMDB) API."""
 
     BASE_URL = "https://api.themoviedb.org/3"
     IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
@@ -32,7 +32,7 @@ class TMDBAPI:
         "вестерн": 37, "western": 37,
     }
 
-    # TV genre IDs (some overlap with movies, some are different)
+    # TV genre IDs
     TV_GENRES = {
         "боевик": 10759, "action": 10759, "приключения": 10759, "adventure": 10759,
         "мультфильм": 16, "анимация": 16, "animation": 16,
@@ -52,69 +52,70 @@ class TMDBAPI:
         "вестерн": 37, "western": 37,
     }
 
-    # Combined for backward compatibility
     GENRES = MOVIE_GENRES
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Reuse HTTP client for connection pooling
-        self._client = httpx.Client(
-            timeout=15.0,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-        )
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
-        """Make a GET request to the API."""
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create async HTTP client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=15.0,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def _get(self, endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
+        """Make an async GET request to the API."""
         try:
+            client = await self._get_client()
             if params is None:
                 params = {}
             params["api_key"] = self.api_key
             params["language"] = "ru-RU"
 
-            response = self._client.get(
-                f"{self.BASE_URL}{endpoint}",
-                params=params,
-            )
+            response = await client.get(f"{self.BASE_URL}{endpoint}", params=params)
             response.raise_for_status()
             return response.json()
         except Exception:
             return None
 
-    def search_movies(self, query: str, page: int = 1) -> list[dict]:
+    async def search_movies(self, query: str, page: int = 1) -> list[dict]:
         """Search movies by title."""
-        data = self._get("/search/movie", {"query": query, "page": page})
-
+        data = await self._get("/search/movie", {"query": query, "page": page})
         if not data or "results" not in data:
             return []
-
         return [self._parse_movie_basic(m) for m in data["results"]]
 
-    def search_person(self, query: str) -> list[dict]:
-        """Search for a person (director, actor) by name."""
-        data = self._get("/search/person", {"query": query})
-
+    async def search_person(self, query: str) -> list[dict]:
+        """Search for a person by name."""
+        data = await self._get("/search/person", {"query": query})
         if not data or "results" not in data:
             return []
-
         return data["results"]
 
-    def get_person_movies(self, person_id: int) -> list[dict]:
-        """Get movies where person worked as director or actor."""
-        data = self._get(f"/person/{person_id}/movie_credits")
-
+    async def get_person_movies(self, person_id: int) -> list[dict]:
+        """Get movies where person worked."""
+        data = await self._get(f"/person/{person_id}/movie_credits")
         if not data:
             return []
 
         movies = []
         seen_ids = set()
 
-        # Movies where person is in crew (director, etc.)
         for movie in data.get("crew", []):
             if movie.get("id") not in seen_ids:
                 seen_ids.add(movie.get("id"))
                 movies.append(self._parse_movie_basic(movie))
 
-        # Movies where person is in cast (actor)
         for movie in data.get("cast", []):
             if movie.get("id") not in seen_ids:
                 seen_ids.add(movie.get("id"))
@@ -122,43 +123,33 @@ class TMDBAPI:
 
         return movies
 
-    def get_movie_details(self, movie_id: int) -> Optional[dict]:
-        """Get detailed information about a movie including IMDB ID."""
-        data = self._get(f"/movie/{movie_id}", {"append_to_response": "external_ids"})
-
+    async def get_movie_details(self, movie_id: int) -> Optional[dict]:
+        """Get detailed information about a movie."""
+        data = await self._get(f"/movie/{movie_id}", {"append_to_response": "external_ids"})
         if not data:
             return None
 
-        # Add IMDB ID from external_ids if available
         external_ids = data.get("external_ids", {})
         data["imdb_id"] = external_ids.get("imdb_id") or data.get("imdb_id")
-
         return self._parse_movie_details(data)
 
-    def get_movie_credits(self, movie_id: int) -> dict:
+    async def get_movie_credits(self, movie_id: int) -> dict:
         """Get cast and crew for a movie."""
-        data = self._get(f"/movie/{movie_id}/credits")
-
+        data = await self._get(f"/movie/{movie_id}/credits")
         if not data:
-            return {"director": None, "actors": []}
-
+            return {"directors": [], "actors": []}
         return self._parse_credits(data)
 
-    def get_full_movie_info(self, movie_id: int) -> Optional[dict]:
+    async def get_full_movie_info(self, movie_id: int) -> Optional[dict]:
         """Get complete movie information including credits in ONE request."""
-        # Combine details + credits + external_ids in single API call
-        data = self._get(f"/movie/{movie_id}", {"append_to_response": "credits,external_ids"})
-
+        data = await self._get(f"/movie/{movie_id}", {"append_to_response": "credits,external_ids"})
         if not data:
             return None
 
-        # Parse IMDB ID
         external_ids = data.get("external_ids", {})
         data["imdb_id"] = external_ids.get("imdb_id") or data.get("imdb_id")
 
         details = self._parse_movie_details(data)
-
-        # Parse credits from same response
         credits_data = data.get("credits", {})
         credits = self._parse_credits(credits_data)
         details["directors"] = credits["directors"]
@@ -168,51 +159,40 @@ class TMDBAPI:
 
     # ========== TV SHOW METHODS ==========
 
-    def search_tv(self, query: str, page: int = 1) -> list[dict]:
+    async def search_tv(self, query: str, page: int = 1) -> list[dict]:
         """Search TV shows by title."""
-        data = self._get("/search/tv", {"query": query, "page": page})
-
+        data = await self._get("/search/tv", {"query": query, "page": page})
         if not data or "results" not in data:
             return []
-
         return [self._parse_tv_basic(tv) for tv in data["results"]]
 
-    def get_tv_details(self, tv_id: int) -> Optional[dict]:
-        """Get detailed information about a TV show including IMDB ID."""
-        data = self._get(f"/tv/{tv_id}", {"append_to_response": "external_ids"})
-
+    async def get_tv_details(self, tv_id: int) -> Optional[dict]:
+        """Get detailed information about a TV show."""
+        data = await self._get(f"/tv/{tv_id}", {"append_to_response": "external_ids"})
         if not data:
             return None
 
         external_ids = data.get("external_ids", {})
         data["imdb_id"] = external_ids.get("imdb_id")
-
         return self._parse_tv_details(data)
 
-    def get_tv_credits(self, tv_id: int) -> dict:
+    async def get_tv_credits(self, tv_id: int) -> dict:
         """Get cast and crew for a TV show."""
-        data = self._get(f"/tv/{tv_id}/credits")
-
+        data = await self._get(f"/tv/{tv_id}/credits")
         if not data:
-            return {"director": None, "actors": []}
-
+            return {"directors": [], "actors": []}
         return self._parse_tv_credits(data)
 
-    def get_full_tv_info(self, tv_id: int) -> Optional[dict]:
+    async def get_full_tv_info(self, tv_id: int) -> Optional[dict]:
         """Get complete TV show information including credits in ONE request."""
-        # Combine details + credits + external_ids in single API call
-        data = self._get(f"/tv/{tv_id}", {"append_to_response": "credits,external_ids"})
-
+        data = await self._get(f"/tv/{tv_id}", {"append_to_response": "credits,external_ids"})
         if not data:
             return None
 
-        # Parse IMDB ID
         external_ids = data.get("external_ids", {})
         data["imdb_id"] = external_ids.get("imdb_id")
 
         details = self._parse_tv_details(data)
-
-        # Parse credits from same response
         credits_data = data.get("credits", {})
         credits = self._parse_tv_credits(credits_data)
         details["directors"] = credits["directors"]
@@ -220,10 +200,9 @@ class TMDBAPI:
 
         return details
 
-    def get_person_tv(self, person_id: int) -> list[dict]:
+    async def get_person_tv(self, person_id: int) -> list[dict]:
         """Get TV shows where person worked."""
-        data = self._get(f"/person/{person_id}/tv_credits")
-
+        data = await self._get(f"/person/{person_id}/tv_credits")
         if not data:
             return []
 
@@ -242,13 +221,13 @@ class TMDBAPI:
 
         return shows
 
-    def discover_tv_by_genre(self, genre_ids: list[int], page: int = 1) -> list[dict]:
+    async def discover_tv_by_genre(self, genre_ids: list[int], page: int = 1) -> list[dict]:
         """Discover TV shows by genre IDs."""
         if not genre_ids:
             return []
 
         genres_str = ",".join(str(g) for g in genre_ids)
-        data = self._get("/discover/tv", {
+        data = await self._get("/discover/tv", {
             "with_genres": genres_str,
             "sort_by": "popularity.desc",
             "page": page,
@@ -256,8 +235,145 @@ class TMDBAPI:
 
         if not data or "results" not in data:
             return []
-
         return [self._parse_tv_basic(tv) for tv in data["results"]]
+
+    # ========== MOVIE METHODS ==========
+
+    async def discover_by_genre(self, genre_ids: list[int], page: int = 1) -> list[dict]:
+        """Discover movies by genre IDs."""
+        if not genre_ids:
+            return []
+
+        genres_str = ",".join(str(g) for g in genre_ids)
+        data = await self._get("/discover/movie", {
+            "with_genres": genres_str,
+            "sort_by": "popularity.desc",
+            "page": page,
+        })
+
+        if not data or "results" not in data:
+            return []
+        return [self._parse_movie_basic(m) for m in data["results"]]
+
+    async def get_recommendations_movie(self, movie_id: int) -> list[dict]:
+        """Get movie recommendations."""
+        data = await self._get(f"/movie/{movie_id}/recommendations")
+        if not data or "results" not in data:
+            return []
+        return [self._parse_movie_basic(m) for m in data["results"][:10]]
+
+    async def get_recommendations_tv(self, tv_id: int) -> list[dict]:
+        """Get TV recommendations."""
+        data = await self._get(f"/tv/{tv_id}/recommendations")
+        if not data or "results" not in data:
+            return []
+        return [self._parse_tv_basic(tv) for tv in data["results"][:10]]
+
+    async def search_keywords(self, query: str) -> list[dict]:
+        """Search for TMDB keywords."""
+        data = await self._get("/search/keyword", {"query": query})
+        if not data or "results" not in data:
+            return []
+        return data["results"]
+
+    async def discover_by_keywords(self, keyword_ids: list[int], page: int = 1) -> list[dict]:
+        """Discover movies by TMDB keyword IDs."""
+        if not keyword_ids:
+            return []
+        keywords_str = "|".join(str(k) for k in keyword_ids)
+        data = await self._get("/discover/movie", {
+            "with_keywords": keywords_str,
+            "sort_by": "popularity.desc",
+            "page": page,
+        })
+        if not data or "results" not in data:
+            return []
+        return [self._parse_movie_basic(m) for m in data["results"]]
+
+    async def discover_tv_by_keywords(self, keyword_ids: list[int], page: int = 1) -> list[dict]:
+        """Discover TV shows by TMDB keyword IDs."""
+        if not keyword_ids:
+            return []
+        keywords_str = "|".join(str(k) for k in keyword_ids)
+        data = await self._get("/discover/tv", {
+            "with_keywords": keywords_str,
+            "sort_by": "popularity.desc",
+            "page": page,
+        })
+        if not data or "results" not in data:
+            return []
+        return [self._parse_tv_basic(tv) for tv in data["results"]]
+
+    async def search_by_keyword(self, keyword: str, page: int = 1) -> list[dict]:
+        """Search movies AND TV shows by title, person name, genre."""
+        seen_movie_ids = set()
+        seen_tv_ids = set()
+        results = []
+
+        keyword_lower = keyword.lower()
+
+        # Prepare all tasks
+        tasks = []
+
+        # Genre searches
+        movie_genre_id = self.MOVIE_GENRES.get(keyword_lower)
+        if movie_genre_id:
+            tasks.append(("discover_movie", self.discover_by_genre([movie_genre_id], page)))
+
+        tv_genre_id = self.TV_GENRES.get(keyword_lower)
+        if tv_genre_id:
+            tasks.append(("discover_tv", self.discover_tv_by_genre([tv_genre_id], page)))
+
+        # Title searches
+        tasks.append(("search_movie", self.search_movies(keyword, page)))
+        tasks.append(("search_tv", self.search_tv(keyword, page)))
+
+        # Person search
+        tasks.append(("search_person", self.search_person(keyword)))
+
+        # Execute all tasks concurrently
+        task_results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+
+        person_ids = []
+        for (task_type, _), result in zip(tasks, task_results):
+            if isinstance(result, Exception):
+                continue
+
+            if task_type == "search_person":
+                person_ids = [p.get("id") for p in result[:2] if p.get("id")]
+            else:
+                is_tv = task_type in ("discover_tv", "search_tv")
+                target_set = seen_tv_ids if is_tv else seen_movie_ids
+                for item in result:
+                    tmdb_id = item.get("kinopoisk_id")
+                    if tmdb_id and tmdb_id not in target_set:
+                        target_set.add(tmdb_id)
+                        results.append(item)
+
+        # Fetch person filmographies concurrently
+        if person_ids:
+            person_tasks = []
+            for pid in person_ids:
+                person_tasks.append(("movie", self.get_person_movies(pid)))
+                person_tasks.append(("tv", self.get_person_tv(pid)))
+
+            person_results = await asyncio.gather(*[t[1] for t in person_tasks], return_exceptions=True)
+
+            for (task_type, _), result in zip(person_tasks, person_results):
+                if isinstance(result, Exception):
+                    continue
+                items = result[:10]
+                is_tv = task_type == "tv"
+                target_set = seen_tv_ids if is_tv else seen_movie_ids
+                for item in items:
+                    tmdb_id = item.get("kinopoisk_id")
+                    if tmdb_id and tmdb_id not in target_set:
+                        target_set.add(tmdb_id)
+                        results.append(item)
+
+        return results
+
+    # ========== PARSERS ==========
 
     def _parse_tv_basic(self, tv: dict) -> dict:
         """Parse basic TV show info from search results."""
@@ -311,7 +427,6 @@ class TMDBAPI:
         directors = []
         actors = []
 
-        # TV shows often have "created_by" in details, but credits has crew
         for person in credits.get("crew", []):
             job = person.get("job", "")
             if job in ("Executive Producer", "Creator"):
@@ -331,161 +446,6 @@ class TMDBAPI:
 
         return {"directors": directors, "actors": actors}
 
-    # ========== MOVIE METHODS ==========
-
-    def discover_by_genre(self, genre_ids: list[int], page: int = 1) -> list[dict]:
-        """Discover movies by genre IDs (AND logic), sorted by popularity."""
-        if not genre_ids:
-            return []
-
-        # TMDB supports comma-separated genre IDs for AND logic
-        genres_str = ",".join(str(g) for g in genre_ids)
-        data = self._get("/discover/movie", {
-            "with_genres": genres_str,
-            "sort_by": "popularity.desc",
-            "page": page,
-        })
-
-        if not data or "results" not in data:
-            return []
-
-        return [self._parse_movie_basic(m) for m in data["results"]]
-
-    def get_recommendations_movie(self, movie_id: int) -> list[dict]:
-        """Get movie recommendations (related content like sequels, spinoffs)."""
-        data = self._get(f"/movie/{movie_id}/recommendations")
-        if not data or "results" not in data:
-            return []
-        return [self._parse_movie_basic(m) for m in data["results"][:10]]
-
-    def get_recommendations_tv(self, tv_id: int) -> list[dict]:
-        """Get TV recommendations (related content like sequels, spinoffs)."""
-        data = self._get(f"/tv/{tv_id}/recommendations")
-        if not data or "results" not in data:
-            return []
-        return [self._parse_tv_basic(tv) for tv in data["results"][:10]]
-
-    def search_keywords(self, query: str) -> list[dict]:
-        """Search for TMDB keywords (tags) by name."""
-        data = self._get("/search/keyword", {"query": query})
-        if not data or "results" not in data:
-            return []
-        return data["results"]  # Returns list of {id, name}
-
-    def discover_by_keywords(self, keyword_ids: list[int], page: int = 1) -> list[dict]:
-        """Discover movies by TMDB keyword IDs."""
-        if not keyword_ids:
-            return []
-        keywords_str = "|".join(str(k) for k in keyword_ids)  # OR logic
-        data = self._get("/discover/movie", {
-            "with_keywords": keywords_str,
-            "sort_by": "popularity.desc",
-            "page": page,
-        })
-        if not data or "results" not in data:
-            return []
-        return [self._parse_movie_basic(m) for m in data["results"]]
-
-    def discover_tv_by_keywords(self, keyword_ids: list[int], page: int = 1) -> list[dict]:
-        """Discover TV shows by TMDB keyword IDs."""
-        if not keyword_ids:
-            return []
-        keywords_str = "|".join(str(k) for k in keyword_ids)
-        data = self._get("/discover/tv", {
-            "with_keywords": keywords_str,
-            "sort_by": "popularity.desc",
-            "page": page,
-        })
-        if not data or "results" not in data:
-            return []
-        return [self._parse_tv_basic(tv) for tv in data["results"]]
-
-    def search_by_keyword(self, keyword: str, page: int = 1) -> list[dict]:
-        """
-        Simple search: movies AND TV shows by title, person name, genre.
-        Uses parallel requests for speed.
-        """
-        seen_movie_ids = set()
-        seen_tv_ids = set()
-        results = []
-
-        keyword_lower = keyword.lower()
-
-        # Prepare tasks for parallel execution
-        tasks = []
-
-        # 1. Genre searches
-        movie_genre_id = self.MOVIE_GENRES.get(keyword_lower)
-        if movie_genre_id:
-            tasks.append(("discover_movie", [movie_genre_id], page))
-
-        tv_genre_id = self.TV_GENRES.get(keyword_lower)
-        if tv_genre_id:
-            tasks.append(("discover_tv", [tv_genre_id], page))
-
-        # 2. Title searches
-        tasks.append(("search_movie", keyword, page))
-        tasks.append(("search_tv", keyword, page))
-
-        # 3. Person search
-        tasks.append(("search_person", keyword, None))
-
-        # Execute all tasks in parallel
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {}
-            for task in tasks:
-                if task[0] == "discover_movie":
-                    futures[executor.submit(self.discover_by_genre, task[1], task[2])] = task
-                elif task[0] == "discover_tv":
-                    futures[executor.submit(self.discover_tv_by_genre, task[1], task[2])] = task
-                elif task[0] == "search_movie":
-                    futures[executor.submit(self.search_movies, task[1], task[2])] = task
-                elif task[0] == "search_tv":
-                    futures[executor.submit(self.search_tv, task[1], task[2])] = task
-                elif task[0] == "search_person":
-                    futures[executor.submit(self.search_person, task[1])] = task
-
-            person_ids = []
-            for future in as_completed(futures):
-                task = futures[future]
-                try:
-                    items = future.result()
-                    if task[0] == "search_person":
-                        person_ids = [p.get("id") for p in items[:2] if p.get("id")]
-                    else:
-                        is_tv = task[0] in ("discover_tv", "search_tv")
-                        target_set = seen_tv_ids if is_tv else seen_movie_ids
-                        for item in items:
-                            tmdb_id = item.get("kinopoisk_id")
-                            if tmdb_id and tmdb_id not in target_set:
-                                target_set.add(tmdb_id)
-                                results.append(item)
-                except Exception:
-                    pass
-
-            # Fetch person filmographies in parallel
-            if person_ids:
-                person_futures = {}
-                for pid in person_ids:
-                    person_futures[executor.submit(self.get_person_movies, pid)] = ("movie", pid)
-                    person_futures[executor.submit(self.get_person_tv, pid)] = ("tv", pid)
-
-                for future in as_completed(person_futures):
-                    task_type, _ = person_futures[future]
-                    try:
-                        items = future.result()[:10]
-                        is_tv = task_type == "tv"
-                        target_set = seen_tv_ids if is_tv else seen_movie_ids
-                        for item in items:
-                            tmdb_id = item.get("kinopoisk_id")
-                            if tmdb_id and tmdb_id not in target_set:
-                                target_set.add(tmdb_id)
-                                results.append(item)
-                    except Exception:
-                        pass
-
-        return results
-
     def _parse_movie_basic(self, movie: dict) -> dict:
         """Parse basic movie info from search results."""
         poster_path = movie.get("poster_path")
@@ -495,12 +455,12 @@ class TMDBAPI:
         year = int(release_date[:4]) if len(release_date) >= 4 else None
 
         return {
-            "kinopoisk_id": movie.get("id"),  # Using kinopoisk_id for compatibility
+            "kinopoisk_id": movie.get("id"),
             "is_tv": False,
             "title": movie.get("title") or movie.get("original_title") or "Unknown",
             "title_original": movie.get("original_title"),
             "year": year,
-            "genres": "",  # Will be filled in get_full_movie_info
+            "genres": "",
             "poster_url": poster_url,
             "kp_rating": movie.get("vote_average"),
             "description": movie.get("overview"),
@@ -521,7 +481,7 @@ class TMDBAPI:
                 pass
 
         return {
-            "kinopoisk_id": movie.get("id"),  # Using kinopoisk_id for compatibility
+            "kinopoisk_id": movie.get("id"),
             "is_tv": False,
             "title": movie.get("title") or movie.get("original_title") or "Unknown",
             "title_original": movie.get("original_title"),

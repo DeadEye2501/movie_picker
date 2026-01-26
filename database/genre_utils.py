@@ -1,7 +1,9 @@
 """Genre normalization utilities for Movie Picker."""
 
 from typing import Optional
+from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Seed data for genres table: (canonical_name, aliases, tmdb_movie_id, tmdb_tv_id)
 GENRE_SEED_DATA = [
@@ -166,3 +168,84 @@ def clear_cache():
     _genre_cache.clear()
     _alias_cache.clear()
     _cache_initialized = False
+
+
+# =============================================================================
+# Async versions
+# =============================================================================
+
+async def init_genre_cache_async(session: AsyncSession):
+    """Initialize genre caches from database (async version)."""
+    global _genre_cache, _alias_cache, _cache_initialized
+
+    from .models import Genre
+
+    _genre_cache.clear()
+    _alias_cache.clear()
+
+    result = await session.execute(select(Genre))
+    for genre in result.scalars().all():
+        _genre_cache[genre.name.lower()] = genre.id
+        if genre.aliases:
+            for alias in genre.aliases.split(', '):
+                alias = alias.strip().lower()
+                if alias:
+                    _alias_cache[alias] = genre.id
+
+    _cache_initialized = True
+
+
+async def normalize_genres_async(genre_string: str, session: AsyncSession) -> list[int]:
+    """
+    Parse and normalize genre string into list of Genre IDs (async version).
+    """
+    if not genre_string:
+        return []
+
+    global _cache_initialized
+    if not _cache_initialized:
+        await init_genre_cache_async(session)
+
+    genre_ids = set()
+
+    # First, check for known combined genre patterns
+    genre_lower = genre_string.lower().strip()
+    if genre_lower in COMBINED_GENRES:
+        for canonical_name in COMBINED_GENRES[genre_lower]:
+            if canonical_name in _genre_cache:
+                genre_ids.add(_genre_cache[canonical_name])
+        return list(genre_ids)
+
+    # Split by comma first
+    parts = genre_string.split(',')
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        part_lower = part.lower()
+
+        # Check if this part is a known combined genre
+        if part_lower in COMBINED_GENRES:
+            for canonical_name in COMBINED_GENRES[part_lower]:
+                if canonical_name in _genre_cache:
+                    genre_ids.add(_genre_cache[canonical_name])
+            continue
+
+        # Check if this part contains " и " (and split further)
+        if ' и ' in part_lower:
+            subparts = part.split(' и ')
+            for subpart in subparts:
+                subpart = subpart.strip().lower()
+                if not subpart:
+                    continue
+                genre_id = _lookup_genre(subpart)
+                if genre_id is not None:
+                    genre_ids.add(genre_id)
+        else:
+            genre_id = _lookup_genre(part_lower)
+            if genre_id is not None:
+                genre_ids.add(genre_id)
+
+    return list(genre_ids)
