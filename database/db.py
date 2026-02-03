@@ -694,9 +694,7 @@ async def get_all_user_ratings_filtered(
     exclude_tags: Optional[list[str]] = None,
     rating_values: Optional[set[int]] = None,
 ) -> list[UserRating]:
-    """Get user ratings with sorting and filtering (optimized SQL filtering)."""
-    from sqlalchemy import exists, and_
-
+    """Get user ratings with sorting and filtering (optimized with SQL sorting)."""
     query = (
         select(UserRating)
         .join(Movie)
@@ -716,48 +714,7 @@ async def get_all_user_ratings_filtered(
     if rating_values:
         query = query.filter(UserRating.rating.in_(rating_values))
 
-    # Genre filter (SQL) - movie must have ALL specified genres
-    if genres:
-        for genre_name in genres:
-            genre_subq = (
-                select(MovieGenre.movie_id)
-                .join(Genre)
-                .filter(
-                    MovieGenre.movie_id == Movie.id,
-                    func.lower(Genre.name) == genre_name.lower()
-                )
-                .exists()
-            )
-            query = query.filter(genre_subq)
-
-    # Tag include filter (SQL) - movie must have ALL specified tags
-    if tags:
-        for tag_name in tags:
-            tag_subq = (
-                select(MovieTag.movie_id)
-                .join(Tag)
-                .filter(
-                    MovieTag.movie_id == Movie.id,
-                    func.lower(Tag.name) == tag_name.lower()
-                )
-                .exists()
-            )
-            query = query.filter(tag_subq)
-
-    # Tag exclude filter (SQL) - movie must NOT have ANY of specified tags
-    if exclude_tags:
-        exclude_subq = (
-            select(MovieTag.movie_id)
-            .join(Tag)
-            .filter(
-                MovieTag.movie_id == Movie.id,
-                func.lower(Tag.name).in_([t.lower() for t in exclude_tags])
-            )
-            .exists()
-        )
-        query = query.filter(~exclude_subq)
-
-    # Sorting (SQL where possible, Python for complex cases)
+    # Sorting (SQL)
     sort_map = {
         "rating_desc": UserRating.rating.desc(),
         "rating_asc": UserRating.rating.asc(),
@@ -772,4 +729,30 @@ async def get_all_user_ratings_filtered(
         query = query.order_by(sort_map[sort_by])
 
     result = await session.execute(query)
-    return list(result.unique().scalars().all())
+    user_ratings = list(result.unique().scalars().all())
+
+    # Genre filter (Python - more reliable for case-insensitive matching)
+    if genres:
+        genres_lower = [g.lower() for g in genres]
+        user_ratings = [
+            ur for ur in user_ratings
+            if all(g in [x.name.lower() for x in ur.movie.genre_list] for g in genres_lower)
+        ]
+
+    # Tag include filter (Python)
+    if tags:
+        tags_lower = [t.lower() for t in tags]
+        user_ratings = [
+            ur for ur in user_ratings
+            if all(t in [x.name.lower() for x in ur.movie.tag_list] for t in tags_lower)
+        ]
+
+    # Tag exclude filter (Python)
+    if exclude_tags:
+        exclude_lower = [t.lower() for t in exclude_tags]
+        user_ratings = [
+            ur for ur in user_ratings
+            if not any(t in [x.name.lower() for x in ur.movie.tag_list] for t in exclude_lower)
+        ]
+
+    return user_ratings
