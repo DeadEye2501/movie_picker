@@ -57,12 +57,26 @@ class RecommenderService:
         # In-memory LRU cache for current session (backed by DB)
         self._memory_cache = LRUCache(max_size=self.MAX_CACHE_SIZE)
 
-    async def calculate_score(self, movie: Movie, session: AsyncSession) -> float:
-        """Calculate personal score for a movie based on user preferences."""
+    async def calculate_score(
+        self,
+        movie: Movie,
+        session: AsyncSession,
+        cached_ratings: list = None
+    ) -> float:
+        """Calculate personal score for a movie based on user preferences.
+
+        Args:
+            movie: Movie to score
+            session: Database session
+            cached_ratings: Pre-loaded user ratings to avoid N+1 queries.
+                           If None, will fetch from DB (slower for batch operations).
+        """
         score = 0.0
 
         # 1. TMDB similarity score (main factor)
-        score += self.WEIGHT_TMDB_SIMILARITY * await self._tmdb_similarity_score(movie, session)
+        score += self.WEIGHT_TMDB_SIMILARITY * await self._tmdb_similarity_score(
+            movie, session, cached_ratings
+        )
 
         # 2. Director rating (from M2M relationship)
         if movie.director_list:
@@ -100,9 +114,19 @@ class RecommenderService:
 
         return score
 
-    async def _tmdb_similarity_score(self, movie: Movie, session: AsyncSession) -> float:
+    async def _tmdb_similarity_score(
+        self,
+        movie: Movie,
+        session: AsyncSession,
+        cached_ratings: list = None
+    ) -> float:
         """Calculate score based on TMDB recommendations from rated movies."""
-        user_ratings = await get_all_user_ratings(session)
+        # Use cached ratings if provided, otherwise fetch (slower)
+        if cached_ratings is None:
+            user_ratings = await get_all_user_ratings(session)
+        else:
+            user_ratings = cached_ratings
+
         if not user_ratings:
             return 0.0
 
@@ -196,7 +220,9 @@ class RecommenderService:
         """Clear the recommendations cache."""
         self._memory_cache.clear()
 
-    async def has_user_ratings(self, session: AsyncSession) -> bool:
+    async def has_user_ratings(self, session: AsyncSession, cached_ratings: list = None) -> bool:
         """Check if user has any rated movies."""
+        if cached_ratings is not None:
+            return len(cached_ratings) > 0
         user_ratings = await get_all_user_ratings(session)
         return len(user_ratings) > 0

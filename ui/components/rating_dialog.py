@@ -16,8 +16,8 @@ def show_rating_dialog(
     review_field = ft.TextField(
         value=current_review or "",
         multiline=True,
-        min_lines=5,
-        max_lines=10,
+        min_lines=12,
+        max_lines=20,
         hint_text="Напишите вашу рецензию...",
         bgcolor=COLORS["surface_variant"],
         border_color=COLORS["divider"],
@@ -47,8 +47,7 @@ def show_rating_dialog(
         ),
         content=ft.Container(
             content=review_field,
-            width=500,
-            height=200,
+            width=700,
         ),
         actions=[
             ft.TextButton(

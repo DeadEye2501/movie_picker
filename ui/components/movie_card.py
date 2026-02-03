@@ -14,36 +14,121 @@ class MovieCard(ft.Container):
         movie: Movie,
         user_rating: Optional[int] = None,
         user_review: Optional[str] = None,
+        user_tags: Optional[list[str]] = None,
         in_wishlist: bool = False,
         ratings_loading: bool = False,
+        collapsed: bool = False,
         on_rating_change: Optional[Callable[[Movie, int], None]] = None,
         on_review_click: Optional[Callable[[Movie], None]] = None,
         on_similar_click: Optional[Callable[[Movie], None]] = None,
         on_rating_delete: Optional[Callable[[Movie], None]] = None,
         on_wishlist_toggle: Optional[Callable[[Movie, bool], None]] = None,
         on_person_click: Optional[Callable[[str, str], None]] = None,  # (name, type: 'director'|'actor')
+        on_collapse_toggle: Optional[Callable[["MovieCard"], None]] = None,
+        on_tags_click: Optional[Callable[[Movie], None]] = None,
     ):
         self.movie = movie
         self.user_rating = user_rating
         self.user_review = user_review
+        self.user_tags = user_tags or []
         self.in_wishlist = in_wishlist
         self.ratings_loading = ratings_loading
+        self.collapsed = collapsed
         self.on_rating_change = on_rating_change
         self.on_review_click = on_review_click
         self.on_similar_click = on_similar_click
         self.on_rating_delete = on_rating_delete
         self.on_wishlist_toggle = on_wishlist_toggle
         self.on_person_click = on_person_click
+        self.on_collapse_toggle = on_collapse_toggle
+        self.on_tags_click = on_tags_click
         self.description_expanded = False
         self.actors_expanded = False
 
+        # Lazy-cached views: only build the current one, cache the other on first toggle
+        if collapsed:
+            self._cached_collapsed = self._build_collapsed_content()
+            self._cached_expanded = None
+            initial_content = self._cached_collapsed
+        else:
+            self._cached_expanded = self._build_content()
+            self._cached_collapsed = None
+            initial_content = self._cached_expanded
+
         super().__init__(
-            content=self._build_content(),
+            content=initial_content,
             bgcolor=COLORS["surface"],
             border_radius=12,
-            padding=16,
-            margin=ft.margin.only(bottom=12),
+            padding=ft.padding.symmetric(horizontal=12, vertical=6) if collapsed
+                else ft.padding.only(left=16, right=12, top=6, bottom=16),
+            margin=ft.margin.only(bottom=4 if collapsed else 12),
         )
+
+    def _build_collapsed_content(self) -> ft.Control:
+        """Build collapsed view: single row with title (left), stars (right), expand button (far right)."""
+        title_text = self.movie.title or "Без названия"
+        year_text = f" ({self.movie.year})" if self.movie.year else ""
+
+        rating_controls = list(self._build_collapsed_star_rating())
+
+        return ft.Row(
+            controls=[
+                ft.Text(
+                    f"{title_text}{year_text}",
+                    size=14,
+                    color=COLORS["text_primary"],
+                    expand=True,
+                    max_lines=1,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                ),
+                ft.Row(
+                    controls=rating_controls,
+                    spacing=0,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.EXPAND_MORE,
+                    icon_size=16,
+                    icon_color=COLORS["text_secondary"],
+                    on_click=lambda e: self._toggle_collapse(),
+                    tooltip="Развернуть",
+                    padding=0,
+                    width=24,
+                    height=24,
+                ),
+            ],
+            spacing=4,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    def _toggle_collapse(self):
+        """Toggle between collapsed and expanded views."""
+        self.collapsed = not self.collapsed
+        self._apply_collapse_state()
+        self.update()
+        if self.on_collapse_toggle:
+            self.on_collapse_toggle(self)
+
+    def _apply_collapse_state(self):
+        """Apply current collapse state using cached views (content swap)."""
+        if self.collapsed:
+            if self._cached_collapsed is None:
+                self._cached_collapsed = self._build_collapsed_content()
+            self.content = self._cached_collapsed
+            self.padding = ft.padding.symmetric(horizontal=12, vertical=6)
+            self.margin = ft.margin.only(bottom=4)
+        else:
+            if self._cached_expanded is None:
+                self._cached_expanded = self._build_content()
+            self.content = self._cached_expanded
+            self.padding = ft.padding.only(left=16, right=12, top=6, bottom=16)
+            self.margin = ft.margin.only(bottom=12)
+
+    def invalidate_view_cache(self):
+        """Invalidate cached views — call when card data changes."""
+        self._cached_expanded = None
+        self._cached_collapsed = None
 
     def _build_content(self) -> ft.Control:
         return ft.Row(
@@ -53,7 +138,7 @@ class MovieCard(ft.Container):
                 ft.Column(
                     controls=[
                         self._build_title_row(),
-                        self._build_info_text(self.movie.genres_display, "Жанры: "),
+                        self._build_genres_and_tags(),
                         self._build_clickable_person("Режиссёр: ", self.movie.directors_display, "director"),
                         self._build_clickable_person("Актёры: ", self.movie.actors_display, "actor"),
                         self._build_description(),
@@ -98,13 +183,30 @@ class MovieCard(ft.Container):
         title_text = self.movie.title or "Без названия"
         year_text = f" ({self.movie.year})" if self.movie.year else ""
 
-        return ft.Text(
-            f"{title_text}{year_text}",
-            size=18,
-            weight=ft.FontWeight.BOLD,
-            color=COLORS["text_primary"],
-            max_lines=2,
-            overflow=ft.TextOverflow.ELLIPSIS,
+        return ft.Row(
+            controls=[
+                ft.Text(
+                    f"{title_text}{year_text}",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                    color=COLORS["text_primary"],
+                    max_lines=2,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    expand=True,
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.EXPAND_LESS,
+                    icon_size=16,
+                    icon_color=COLORS["text_secondary"],
+                    on_click=lambda e: self._toggle_collapse(),
+                    tooltip="Свернуть",
+                    padding=0,
+                    width=24,
+                    height=24,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.START,
         )
 
     def _build_info_text(self, value: Optional[str], prefix: str = "") -> ft.Control:
@@ -174,7 +276,8 @@ class MovieCard(ft.Container):
 
     def _toggle_actors(self, e):
         self.actors_expanded = not self.actors_expanded
-        self.content = self._build_content()
+        self._cached_expanded = self._build_content()
+        self.content = self._cached_expanded
         self.update()
 
     def _build_description(self) -> ft.Control:
@@ -216,7 +319,8 @@ class MovieCard(ft.Container):
 
     def _toggle_description(self, e):
         self.description_expanded = not self.description_expanded
-        self.content = self._build_content()
+        self._cached_expanded = self._build_content()
+        self.content = self._cached_expanded
         self.update()
 
     def _get_external_url(self) -> Optional[str]:
@@ -391,6 +495,40 @@ class MovieCard(ft.Container):
         }
         return labels.get(rating, "")
 
+    def _build_collapsed_star_rating(self) -> list[ft.Control]:
+        """Build compact star rating for collapsed view (smaller icons, no delete button)."""
+        stars = []
+        star_color = self._get_star_color(self.user_rating) if self.user_rating else COLORS["star_empty"]
+
+        rating_labels = {
+            1: "1 — Отвратительно",
+            2: "2 — Плохо",
+            3: "3 — Уныло",
+            4: "4 — Посредственно",
+            5: "5 — Средне",
+            6: "6 — Неплохо",
+            7: "7 — Интересно",
+            8: "8 — Хорошо",
+            9: "9 — Отлично",
+            10: "10 — Шедевр",
+        }
+
+        for i in range(1, 11):
+            is_filled = self.user_rating is not None and i <= self.user_rating
+            star = ft.IconButton(
+                icon=ft.Icons.STAR if is_filled else ft.Icons.STAR_BORDER,
+                icon_size=14,
+                icon_color=star_color if is_filled else COLORS["star_empty"],
+                on_click=lambda e, rating=i: self._handle_rating_click(rating),
+                tooltip=rating_labels[i],
+                padding=0,
+                width=20,
+                height=20,
+            )
+            stars.append(star)
+
+        return stars
+
     def _build_star_rating(self) -> list[ft.Control]:
         stars = []
         star_color = self._get_star_color(self.user_rating) if self.user_rating else COLORS["star_empty"]
@@ -438,15 +576,51 @@ class MovieCard(ft.Container):
 
         return stars
 
+    def _build_genres_and_tags(self) -> ft.Control:
+        """Build row with genres text followed by tag chips."""
+        genres = self.movie.genres_display
+        has_genres = bool(genres)
+        has_tags = bool(self.user_tags)
+
+        if not has_genres and not has_tags:
+            return ft.Container(height=0)
+
+        controls = []
+
+        if has_genres:
+            controls.append(
+                ft.Text(
+                    f"Жанры: {genres}",
+                    size=13,
+                    color=COLORS["text_secondary"],
+                    no_wrap=True,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                )
+            )
+
+        if has_tags:
+            for tag_name in self.user_tags:
+                controls.append(
+                    ft.Container(
+                        content=ft.Text(tag_name, size=11, color=COLORS["text_primary"]),
+                        bgcolor=COLORS["surface_variant"],
+                        border_radius=10,
+                        padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                    )
+                )
+
+        return ft.Row(controls=controls, spacing=4, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
     def _build_actions_row(self) -> ft.Control:
-        review_button_text = "Редактировать рецензию" if self.user_review else "Написать рецензию"
+        has_review = bool(self.user_review)
+        review_button_text = "Редактировать рецензию" if has_review else "Написать рецензию"
 
         controls = [
             ft.TextButton(
                 review_button_text,
                 icon=ft.Icons.RATE_REVIEW,
                 on_click=lambda e: self._handle_review_click(),
-                style=ft.ButtonStyle(color=COLORS["primary"]),
+                style=ft.ButtonStyle(color=COLORS["primary"] if has_review else COLORS["text_secondary"]),
             ),
             ft.TextButton(
                 "Найти похожие",
@@ -455,6 +629,18 @@ class MovieCard(ft.Container):
                 style=ft.ButtonStyle(color=COLORS["text_secondary"]),
             ),
         ]
+
+        # Show tags button for rated movies
+        if self.user_rating is not None:
+            has_tags = bool(self.user_tags)
+            controls.append(
+                ft.TextButton(
+                    "Теги",
+                    icon=ft.Icons.LABEL if has_tags else ft.Icons.LABEL_OUTLINE,
+                    on_click=lambda e: self._handle_tags_click(),
+                    style=ft.ButtonStyle(color=COLORS["primary"] if has_tags else COLORS["text_secondary"]),
+                )
+            )
 
         # Show wishlist button only for unrated movies
         if self.user_rating is None:
@@ -469,7 +655,7 @@ class MovieCard(ft.Container):
                 )
             )
 
-        return ft.Row(controls=controls)
+        return ft.Row(controls=controls, wrap=True)
 
     def _handle_rating_click(self, rating: int):
         if self.on_rating_change:
@@ -486,6 +672,10 @@ class MovieCard(ft.Container):
     def _handle_similar_click(self):
         if self.on_similar_click:
             self.on_similar_click(self.movie)
+
+    def _handle_tags_click(self):
+        if self.on_tags_click:
+            self.on_tags_click(self.movie)
 
     def _handle_wishlist_toggle(self):
         if self.on_wishlist_toggle:

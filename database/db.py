@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import selectinload
 
 from .models import (
-    Base, Movie, UserRating, Genre, Director, Actor,
-    MovieGenre, MovieDirector, MovieActor,
+    Base, Movie, UserRating, Genre, Director, Actor, Tag,
+    MovieGenre, MovieDirector, MovieActor, MovieTag,
     Wishlist, RecommendationCache, utc_now
 )
 from .genre_utils import GENRE_SEED_DATA, init_genre_cache_async, clear_cache
@@ -31,6 +31,8 @@ async def init_db(db_path: str = "movie_picker.db"):
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Add performance indexes (safe to run multiple times)
+        await _create_indexes(conn)
 
     _SessionLocal = async_sessionmaker(bind=_engine, expire_on_commit=False)
 
@@ -41,6 +43,33 @@ async def init_db(db_path: str = "movie_picker.db"):
         if count == 0:
             await _seed_genres(session)
         await init_genre_cache_async(session)
+
+
+async def _create_indexes(conn):
+    """Create performance indexes if they don't exist."""
+    from sqlalchemy import text
+    indexes = [
+        # Movie search indexes
+        "CREATE INDEX IF NOT EXISTS idx_movie_title ON movies(title)",
+        "CREATE INDEX IF NOT EXISTS idx_movie_title_original ON movies(title_original)",
+        "CREATE INDEX IF NOT EXISTS idx_movie_year ON movies(year)",
+        # Entity name indexes for search JOINs
+        "CREATE INDEX IF NOT EXISTS idx_genre_name ON genres(name)",
+        "CREATE INDEX IF NOT EXISTS idx_director_name ON directors(name)",
+        "CREATE INDEX IF NOT EXISTS idx_actor_name ON actors(name)",
+        # UserRating indexes for filtering
+        "CREATE INDEX IF NOT EXISTS idx_user_rating_rating ON user_ratings(rating)",
+        "CREATE INDEX IF NOT EXISTS idx_user_rating_movie_id ON user_ratings(movie_id)",
+        # M2M indexes for faster JOINs
+        "CREATE INDEX IF NOT EXISTS idx_movie_genres_genre_id ON movie_genres(genre_id)",
+        "CREATE INDEX IF NOT EXISTS idx_movie_directors_director_id ON movie_directors(director_id)",
+        "CREATE INDEX IF NOT EXISTS idx_movie_actors_actor_id ON movie_actors(actor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_movie_tags_tag_id ON movie_tags(tag_id)",
+        # Wishlist index
+        "CREATE INDEX IF NOT EXISTS idx_wishlist_movie_id ON wishlist(movie_id)",
+    ]
+    for idx_sql in indexes:
+        await conn.execute(text(idx_sql))
 
 
 async def _seed_genres(session: AsyncSession):
@@ -335,57 +364,23 @@ async def get_all_user_ratings(session: AsyncSession) -> list[UserRating]:
     return list(result.unique().scalars().all())
 
 
-async def get_all_user_ratings_filtered(
-    session: AsyncSession,
-    sort_by: str = "date_desc",
-    min_rating: Optional[int] = None,
-    max_rating: Optional[int] = None,
-    genres: Optional[list[str]] = None,
-) -> list[UserRating]:
-    """Get user ratings with sorting and filtering."""
-    query = (
+async def get_user_ratings_batch(session: AsyncSession, movie_ids: list[int]) -> dict[int, UserRating]:
+    """Get user ratings for multiple movies in a single query.
+
+    Returns dict mapping movie_id -> UserRating.
+    """
+    if not movie_ids:
+        return {}
+
+    result = await session.execute(
         select(UserRating)
-        .join(Movie)
-        .options(
-            selectinload(UserRating.movie)
-            .selectinload(Movie.genre_list)
-        )
+        .options(selectinload(UserRating.movie).selectinload(Movie.genre_list))
+        .filter(UserRating.movie_id.in_(movie_ids))
     )
+    ratings = result.unique().scalars().all()
+    return {ur.movie_id: ur for ur in ratings}
 
-    if min_rating is not None:
-        query = query.filter(UserRating.rating >= min_rating)
-    if max_rating is not None:
-        query = query.filter(UserRating.rating <= max_rating)
 
-    result = await session.execute(query)
-    user_ratings = list(result.unique().scalars().all())
-
-    # Apply genre filter
-    if genres:
-        genres_lower = [g.lower() for g in genres]
-        filtered = []
-        for ur in user_ratings:
-            movie_genres = [g.name.lower() for g in ur.movie.genre_list]
-            if any(g in movie_genres for g in genres_lower):
-                filtered.append(ur)
-        user_ratings = filtered
-
-    # Apply sorting
-    sort_keys = {
-        "rating_desc": (lambda ur: ur.rating, True),
-        "rating_asc": (lambda ur: ur.rating, False),
-        "date_desc": (lambda ur: ur.updated_at or ur.created_at, True),
-        "date_asc": (lambda ur: ur.updated_at or ur.created_at, False),
-        "year_desc": (lambda ur: ur.movie.year or 0, True),
-        "year_asc": (lambda ur: ur.movie.year or 0, False),
-        "title_asc": (lambda ur: ur.movie.title.lower(), False),
-        "title_desc": (lambda ur: ur.movie.title.lower(), True),
-    }
-    if sort_by in sort_keys:
-        key_func, reverse = sort_keys[sort_by]
-        user_ratings.sort(key=key_func, reverse=reverse)
-
-    return user_ratings
 
 
 async def get_rated_movies(session: AsyncSession, min_rating: Optional[int] = None) -> list[Movie]:
@@ -629,3 +624,152 @@ async def get_wishlist_movie_ids(session: AsyncSession) -> set[int]:
     """Get set of movie IDs in wishlist (for quick lookup)."""
     result = await session.execute(select(Wishlist.movie_id))
     return {row[0] for row in result.all()}
+
+
+# =============================================================================
+# Tags
+# =============================================================================
+
+async def get_all_tags(session: AsyncSession) -> list[Tag]:
+    """Get all user tags ordered by name."""
+    result = await session.execute(select(Tag).order_by(Tag.name))
+    return list(result.scalars().all())
+
+
+async def create_tag(session: AsyncSession, name: str) -> Tag:
+    """Create a new tag."""
+    tag = Tag(name=name.strip())
+    session.add(tag)
+    await session.commit()
+    await session.refresh(tag)
+    return tag
+
+
+async def rename_tag(session: AsyncSession, tag_id: int, new_name: str) -> bool:
+    """Rename a tag."""
+    result = await session.execute(select(Tag).filter(Tag.id == tag_id))
+    tag = result.scalar_one_or_none()
+    if tag is None:
+        return False
+    tag.name = new_name.strip()
+    await session.commit()
+    return True
+
+
+async def delete_tag(session: AsyncSession, tag_id: int) -> bool:
+    """Delete a tag and its associations."""
+    result = await session.execute(select(Tag).filter(Tag.id == tag_id))
+    tag = result.scalar_one_or_none()
+    if tag is None:
+        return False
+    await session.execute(delete(MovieTag).filter(MovieTag.tag_id == tag_id))
+    await session.delete(tag)
+    await session.commit()
+    return True
+
+
+async def set_movie_tags(session: AsyncSession, movie_id: int, tag_ids: list[int]):
+    """Set tags for a movie (replaces existing)."""
+    await session.execute(delete(MovieTag).filter(MovieTag.movie_id == movie_id))
+    for tag_id in tag_ids:
+        session.add(MovieTag(movie_id=movie_id, tag_id=tag_id))
+    await session.commit()
+
+
+async def get_movie_tags(session: AsyncSession, movie_id: int) -> list[Tag]:
+    """Get tags for a movie."""
+    result = await session.execute(
+        select(Tag).join(MovieTag).filter(MovieTag.movie_id == movie_id).order_by(Tag.name)
+    )
+    return list(result.scalars().all())
+
+
+async def get_all_user_ratings_filtered(
+    session: AsyncSession,
+    sort_by: str = "date_desc",
+    min_rating: Optional[int] = None,
+    max_rating: Optional[int] = None,
+    genres: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    exclude_tags: Optional[list[str]] = None,
+    rating_values: Optional[set[int]] = None,
+) -> list[UserRating]:
+    """Get user ratings with sorting and filtering (optimized SQL filtering)."""
+    from sqlalchemy import exists, and_
+
+    query = (
+        select(UserRating)
+        .join(Movie)
+        .options(
+            selectinload(UserRating.movie)
+            .selectinload(Movie.genre_list),
+            selectinload(UserRating.movie)
+            .selectinload(Movie.tag_list),
+        )
+    )
+
+    # Rating filters (SQL)
+    if min_rating is not None:
+        query = query.filter(UserRating.rating >= min_rating)
+    if max_rating is not None:
+        query = query.filter(UserRating.rating <= max_rating)
+    if rating_values:
+        query = query.filter(UserRating.rating.in_(rating_values))
+
+    # Genre filter (SQL) - movie must have ALL specified genres
+    if genres:
+        for genre_name in genres:
+            genre_subq = (
+                select(MovieGenre.movie_id)
+                .join(Genre)
+                .filter(
+                    MovieGenre.movie_id == Movie.id,
+                    func.lower(Genre.name) == genre_name.lower()
+                )
+                .exists()
+            )
+            query = query.filter(genre_subq)
+
+    # Tag include filter (SQL) - movie must have ALL specified tags
+    if tags:
+        for tag_name in tags:
+            tag_subq = (
+                select(MovieTag.movie_id)
+                .join(Tag)
+                .filter(
+                    MovieTag.movie_id == Movie.id,
+                    func.lower(Tag.name) == tag_name.lower()
+                )
+                .exists()
+            )
+            query = query.filter(tag_subq)
+
+    # Tag exclude filter (SQL) - movie must NOT have ANY of specified tags
+    if exclude_tags:
+        exclude_subq = (
+            select(MovieTag.movie_id)
+            .join(Tag)
+            .filter(
+                MovieTag.movie_id == Movie.id,
+                func.lower(Tag.name).in_([t.lower() for t in exclude_tags])
+            )
+            .exists()
+        )
+        query = query.filter(~exclude_subq)
+
+    # Sorting (SQL where possible, Python for complex cases)
+    sort_map = {
+        "rating_desc": UserRating.rating.desc(),
+        "rating_asc": UserRating.rating.asc(),
+        "date_desc": UserRating.updated_at.desc(),
+        "date_asc": UserRating.updated_at.asc(),
+        "year_desc": Movie.year.desc().nulls_last(),
+        "year_asc": Movie.year.asc().nulls_last(),
+        "title_asc": Movie.title.asc(),
+        "title_desc": Movie.title.desc(),
+    }
+    if sort_by in sort_map:
+        query = query.order_by(sort_map[sort_by])
+
+    result = await session.execute(query)
+    return list(result.unique().scalars().all())

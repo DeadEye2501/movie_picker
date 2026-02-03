@@ -14,6 +14,14 @@ def utc_now():
 # M2M Association Tables
 # =============================================================================
 
+class MovieTag(Base):
+    """Many-to-many relationship between movies and user tags."""
+    __tablename__ = "movie_tags"
+
+    movie_id = Column(Integer, ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True)
+    tag_id = Column(Integer, ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True)
+
+
 class MovieGenre(Base):
     """Many-to-many relationship between movies and genres."""
     __tablename__ = "movie_genres"
@@ -96,6 +104,20 @@ class Actor(Base):
         return f"<Actor(name='{self.name}', tmdb_id={self.tmdb_id})>"
 
 
+class Tag(Base):
+    """User-created tags for organizing rated movies."""
+    __tablename__ = "tags"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, unique=True)
+    created_at = Column(DateTime, default=utc_now)
+
+    movies = relationship("Movie", secondary="movie_tags", back_populates="tag_list")
+
+    def __repr__(self):
+        return f"<Tag(name='{self.name}')>"
+
+
 # =============================================================================
 # Main Tables
 # =============================================================================
@@ -126,9 +148,10 @@ class Movie(Base):
 
     # Relationships
     user_rating = relationship("UserRating", back_populates="movie", uselist=False)
-    genre_list = relationship("Genre", secondary="movie_genres", back_populates="movies", lazy="joined")
-    director_list = relationship("Director", secondary="movie_directors", back_populates="movies", lazy="joined")
-    actor_list = relationship("Actor", secondary="movie_actors", back_populates="movies", lazy="joined")
+    genre_list = relationship("Genre", secondary="movie_genres", back_populates="movies", lazy="selectin")
+    director_list = relationship("Director", secondary="movie_directors", back_populates="movies", lazy="selectin")
+    actor_list = relationship("Actor", secondary="movie_actors", back_populates="movies", lazy="selectin")
+    tag_list = relationship("Tag", secondary="movie_tags", back_populates="movies", lazy="selectin")
 
     @property
     def genres_display(self) -> str:

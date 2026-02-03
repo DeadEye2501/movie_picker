@@ -5,7 +5,7 @@ from typing import Optional, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api import TMDBAPI, OMDBAPI, KinopoiskAPI, MDBListAPI
-from database import get_movie_by_kp_id, save_movie, search_local_movies
+from database import get_movie_by_kp_id, save_movie, search_local_movies, get_all_user_ratings
 from database.models import Movie
 from .recommender import RecommenderService
 
@@ -31,7 +31,7 @@ class SearchService:
         """Close the search service (clears any internal caches)."""
         self.recommender.clear_cache()
 
-    async def search_movies(self, session: AsyncSession, query: str, page: int = 1, genres: list[int] = None, skip_ratings: bool = False) -> list[Movie]:
+    async def search_movies(self, session: AsyncSession, query: str, page: int = 1, genres: list[int] = None, skip_ratings: bool = False, start_page: int = 1, num_pages: int = 3) -> list[Movie]:
         """Search for movies AND TV shows by keyword and/or genres."""
         query_words = [w.lower() for w in query.split() if w.strip()]
         genres = genres or []
@@ -46,8 +46,11 @@ class SearchService:
 
         from database import get_rated_movies, get_cached_recommendations, save_cached_recommendations
 
-        # 1. Get recommendations from user's rated movies (from cache)
-        rated_movies = await get_rated_movies(session, min_rating=6)
+        # 1. Get recommendations from user's rated movies (only on first page)
+        if start_page > 1:
+            rated_movies = []
+        else:
+            rated_movies = await get_rated_movies(session, min_rating=6)
         rated_movies = rated_movies[:10]
         uncached_rated = []
 
@@ -90,9 +93,10 @@ class SearchService:
         api_tasks = []
         task_info = []
 
+        end_page = start_page + num_pages
         if genres:
             tv_genres = self._map_movie_genres_to_tv(genres)
-            for pg in range(1, 4):
+            for pg in range(start_page, end_page):
                 api_tasks.append(self.tmdb_api.discover_by_genre(genres, pg))
                 task_info.append(("discover_movie", genres, pg))
                 if tv_genres:
@@ -101,7 +105,7 @@ class SearchService:
 
         if query_words:
             for word in query_words:
-                for pg in range(1, 4):
+                for pg in range(start_page, end_page):
                     api_tasks.append(self.tmdb_api.search_by_keyword(word, pg))
                     task_info.append(("search", word, pg))
 
@@ -118,8 +122,8 @@ class SearchService:
                         target_set.add(tmdb_id)
                         all_search_results.append(item)
 
-        # 3. Search local database
-        if query_words:
+        # 3. Search local database (only on first page)
+        if query_words and start_page == 1:
             for word in query_words:
                 local_movies = await search_local_movies(session, word)
                 for movie in local_movies:
@@ -450,12 +454,15 @@ class SearchService:
         if not movies:
             return movies
 
-        if not await self.recommender.has_user_ratings(session):
+        # Pre-load all user ratings ONCE for the entire sorting operation
+        cached_ratings = await get_all_user_ratings(session)
+
+        if not await self.recommender.has_user_ratings(session, cached_ratings):
             return sorted(movies, key=lambda m: m.tmdb_rating or 0, reverse=True)
 
         scored_movies = []
         for movie in movies:
-            score = await self.recommender.calculate_score(movie, session)
+            score = await self.recommender.calculate_score(movie, session, cached_ratings)
             scored_movies.append((movie, score))
 
         scored_movies.sort(key=lambda x: x[1], reverse=True)
@@ -463,14 +470,15 @@ class SearchService:
 
     async def find_magic_recommendation(self, session: AsyncSession) -> Optional[Movie]:
         """Find the single best unwatched movie based on user's preferences."""
-        from database import get_rated_movies, get_all_user_ratings, get_cached_recommendations, save_cached_recommendations, get_wishlist_movie_ids
+        from database import get_rated_movies, get_cached_recommendations, save_cached_recommendations, get_wishlist_movie_ids
 
         rated_movies = await get_rated_movies(session, min_rating=6)
         if not rated_movies:
             return None
 
-        all_ratings = await get_all_user_ratings(session)
-        rated_ids = {(ur.movie.kinopoisk_id, ur.movie.is_tv) for ur in all_ratings}
+        # Pre-load all user ratings ONCE (used for filtering and scoring)
+        cached_ratings = await get_all_user_ratings(session)
+        rated_ids = {(ur.movie.kinopoisk_id, ur.movie.is_tv) for ur in cached_ratings}
         
         # Get wishlist movie IDs to exclude them from recommendations
         wishlist_ids = await get_wishlist_movie_ids(session)
@@ -530,7 +538,7 @@ class SearchService:
             # Skip movies that are in wishlist
             if movie.id in wishlist_ids:
                 continue
-            score = await self.recommender.calculate_score(movie, session)
+            score = await self.recommender.calculate_score(movie, session, cached_ratings)
             if score > best_score:
                 best_score = score
                 best_movie = movie

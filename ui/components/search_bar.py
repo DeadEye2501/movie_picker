@@ -29,7 +29,7 @@ GENRES = [
 
 
 class SearchBar(ft.Container):
-    """Search bar component with action buttons and genre filter."""
+    """Search bar component with action buttons, genre and tag filters."""
 
     def __init__(
         self,
@@ -38,12 +38,21 @@ class SearchBar(ft.Container):
         on_wishlist: Optional[Callable[[], None]] = None,
         on_magic: Optional[Callable[[], None]] = None,
         on_genre_change: Optional[Callable[[], None]] = None,
+        on_collapse_all: Optional[Callable[[], None]] = None,
+        on_manage_tags: Optional[Callable[[], None]] = None,
+        on_rating_filter: Optional[Callable[[], None]] = None,
+        on_stats: Optional[Callable[[], None]] = None,
     ):
         self.on_search = on_search
         self.on_my_ratings = on_my_ratings
         self.on_wishlist = on_wishlist
         self.on_magic = on_magic
         self.on_genre_change = on_genre_change
+        self.on_collapse_all = on_collapse_all
+        self.on_manage_tags = on_manage_tags
+        self.on_rating_filter = on_rating_filter
+        self.on_stats = on_stats
+        self._all_collapsed = False
         self.selected_genres: list[int] = []
 
         self.clear_icon = ft.Container(
@@ -92,6 +101,39 @@ class SearchBar(ft.Container):
             overflow=ft.TextOverflow.ELLIPSIS,
         )
 
+        self.tag_button = ft.IconButton(
+            icon=ft.Icons.LABEL_OUTLINE,
+            icon_size=20,
+            icon_color=COLORS["text_primary"],
+            bgcolor=COLORS["surface_variant"],
+            on_click=lambda e: self._handle_manage_tags(),
+            tooltip="Управление тегами",
+            width=36,
+            height=36,
+        )
+
+        self.rating_filter_button = ft.IconButton(
+            icon=ft.Icons.STAR_BORDER,
+            icon_size=20,
+            icon_color=COLORS["text_primary"],
+            bgcolor=COLORS["surface_variant"],
+            on_click=lambda e: self._handle_rating_filter(),
+            tooltip="Фильтр по оценке",
+            width=36,
+            height=36,
+        )
+
+        self.collapse_all_button = ft.IconButton(
+            icon=ft.Icons.UNFOLD_LESS,
+            icon_size=20,
+            icon_color=COLORS["text_primary"],
+            bgcolor=COLORS["surface_variant"],
+            on_click=self._handle_collapse_all,
+            tooltip="Свернуть все",
+            width=36,
+            height=36,
+        )
+
         # Ratings button (becomes sort button in ratings mode)
         self.ratings_button = None  # Will be built in _build_ratings_button
         self.ratings_icon_container = None
@@ -111,6 +153,8 @@ class SearchBar(ft.Container):
                     controls=[
                         self.search_field,
                         self.genre_button,
+                        self.tag_button,
+                        self.rating_filter_button,
                         ft.IconButton(
                             icon=ft.Icons.SEARCH,
                             icon_size=20,
@@ -131,8 +175,10 @@ class SearchBar(ft.Container):
                             width=36,
                             height=36,
                         ),
+                        self.collapse_all_button,
                         self._build_ratings_button(),
                         self._build_wishlist_button(),
+                        self._build_stats_button(),
                     ],
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -210,6 +256,16 @@ class SearchBar(ft.Container):
         dialog.open = True
         self.page.update()
 
+    def _handle_manage_tags(self):
+        """Open tag management dialog."""
+        if self.on_manage_tags:
+            self.on_manage_tags()
+
+    def _handle_rating_filter(self):
+        """Open rating filter dialog."""
+        if self.on_rating_filter:
+            self.on_rating_filter()
+
     def _update_selected_genres_text(self):
         """Update the text showing selected genres."""
         if self.selected_genres:
@@ -243,6 +299,14 @@ class SearchBar(ft.Container):
     def _handle_magic(self):
         if self.on_magic:
             self.on_magic()
+
+    def _handle_collapse_all(self, e):
+        self._all_collapsed = not self._all_collapsed
+        self.collapse_all_button.icon = ft.Icons.UNFOLD_MORE if self._all_collapsed else ft.Icons.UNFOLD_LESS
+        self.collapse_all_button.tooltip = "Развернуть все" if self._all_collapsed else "Свернуть все"
+        self.collapse_all_button.update()
+        if self.on_collapse_all:
+            self.on_collapse_all()
 
     def _handle_wishlist(self):
         if self.on_wishlist:
@@ -309,6 +373,24 @@ class SearchBar(ft.Container):
         )
         return self.wishlist_button
 
+    def _build_stats_button(self) -> ft.IconButton:
+        """Build the statistics button."""
+        self.stats_button = ft.IconButton(
+            icon=ft.Icons.BAR_CHART,
+            icon_size=20,
+            icon_color=COLORS["text_primary"],
+            bgcolor=COLORS["surface_variant"],
+            on_click=lambda e: self._handle_stats(),
+            tooltip="Статистика",
+            width=36,
+            height=36,
+        )
+        return self.stats_button
+
+    def _handle_stats(self):
+        if self.on_stats:
+            self.on_stats()
+
     def set_wishlist_active(self, active: bool):
         """Set wishlist button active state."""
         self.wishlist_button.icon = ft.Icons.BOOKMARK if active else ft.Icons.BOOKMARK_BORDER
@@ -321,4 +403,8 @@ class SearchBar(ft.Container):
         self.selected_genres = []
         self._update_selected_genres_text()
         self.genre_button.icon_color = COLORS["text_primary"]
+        self.tag_button.icon = ft.Icons.LABEL_OUTLINE
+        self.tag_button.icon_color = COLORS["text_primary"]
+        self.rating_filter_button.icon = ft.Icons.STAR_BORDER
+        self.rating_filter_button.icon_color = COLORS["text_primary"]
         self.update()
