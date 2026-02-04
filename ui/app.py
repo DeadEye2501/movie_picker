@@ -52,6 +52,7 @@ class MoviePickerApp:
         self._selected_tag_ids: set[int] = set()
         self._excluded_tag_ids: set[int] = set()
         self._selected_rating_values: set[int] = set()
+        self._tags_cache: list = []  # Cached tags for fast dialog opening
         # Search pagination state
         self._search_query: str = ""
         self._search_genres: list[int] = []
@@ -77,6 +78,9 @@ class MoviePickerApp:
         
         # Initialize database
         await init_db(self.db_path)
+
+        # Load tags cache
+        await self._refresh_tags_cache()
 
         # Handle window close gracefully
         async def on_window_event(e):
@@ -539,17 +543,18 @@ class MoviePickerApp:
 
         self.page.run_task(do_show)
 
+    async def _refresh_tags_cache(self):
+        """Refresh the tags cache from database."""
+        try:
+            async with get_session() as session:
+                self._tags_cache = await get_all_tags(session)
+        except Exception:
+            self._tags_cache = []
+
     def _handle_manage_tags(self):
         """Handle global tag management button click."""
-        async def do_show():
-            try:
-                async with get_session() as session:
-                    all_tags = await get_all_tags(session)
-                    self._show_manage_tags_dialog(all_tags)
-            except Exception:
-                pass
-
-        self.page.run_task(do_show)
+        # Use cached tags for instant dialog opening
+        self._show_manage_tags_dialog(self._tags_cache)
 
     def _show_manage_tags_dialog(self, all_tags):
         """Show dialog for filtering, creating, renaming and deleting tags."""
@@ -646,8 +651,7 @@ class MoviePickerApp:
         )
 
         def close_dialog(e=None):
-            dialog.open = False
-            self.page.update()
+            self.page.pop_dialog()
 
         def _delete_tag(row, tag_id):
             async def do_delete():
@@ -657,6 +661,7 @@ class MoviePickerApp:
                         if row in tags_column.controls:
                             tags_column.controls.remove(row)
                         self._selected_tag_ids.discard(tag_id)
+                        self._tags_cache = [t for t in self._tags_cache if t.id != tag_id]
                         self.page.update()
                 except Exception:
                     pass
@@ -671,6 +676,7 @@ class MoviePickerApp:
                 try:
                     async with get_session() as session:
                         tag = await create_tag(session, name)
+                        self._tags_cache.append(tag)
                         row = build_tag_row(tag.id, tag.name, 0)
                         row.controls[2].on_click = lambda ev, r=row, tid=tag.id: _delete_tag(r, tid)
                         tags_column.controls.append(row)
@@ -730,6 +736,11 @@ class MoviePickerApp:
                         async with get_session() as session:
                             for tag_id, new_name in rename_tasks:
                                 await rename_tag(session, tag_id, new_name)
+                                # Update cache
+                                for t in self._tags_cache:
+                                    if t.id == tag_id:
+                                        t.name = new_name
+                                        break
                     if not is_shutting_down():
                         if self.is_stats_mode:
                             await self._load_stats()
@@ -788,9 +799,7 @@ class MoviePickerApp:
             bgcolor=COLORS["surface"],
         )
 
-        self.page.overlay.append(dialog)
-        dialog.open = True
-        self.page.update()
+        self.page.show_dialog(dialog)
 
     def _handle_rating_filter(self):
         """Handle rating filter button click."""
@@ -844,8 +853,7 @@ class MoviePickerApp:
             rows.append(row)
 
         def close_dialog(e=None):
-            dialog.open = False
-            self.page.update()
+            self.page.pop_dialog()
 
         def _clear_and_apply(e):
             for cb in checkboxes:
@@ -887,19 +895,17 @@ class MoviePickerApp:
             bgcolor=COLORS["surface"],
         )
 
-        self.page.overlay.append(dialog)
-        dialog.open = True
-        self.page.update()
+        self.page.show_dialog(dialog)
 
     def _handle_tags_click(self, movie: Movie):
         """Handle per-movie tags button click - assign/unassign existing tags."""
         async def do_show():
             try:
                 async with get_session() as session:
-                    all_tags = await get_all_tags(session)
                     movie_tag_list = await get_movie_tags(session, movie.id)
                     movie_tag_ids = {t.id for t in movie_tag_list}
-                    self._show_movie_tags_dialog(movie, all_tags, movie_tag_ids)
+                    # Use cached tags list
+                    self._show_movie_tags_dialog(movie, self._tags_cache, movie_tag_ids)
             except Exception:
                 pass
 
@@ -923,12 +929,9 @@ class MoviePickerApp:
             )
 
             def _close():
-                dialog.open = False
-                self.page.update()
+                self.page.pop_dialog()
 
-            self.page.overlay.append(dialog)
-            dialog.open = True
-            self.page.update()
+            self.page.show_dialog(dialog)
             return
 
         checkboxes = []
@@ -945,8 +948,7 @@ class MoviePickerApp:
         tags_column = ft.Column(controls=checkboxes, scroll=ft.ScrollMode.AUTO, spacing=0)
 
         def close_dialog(e=None):
-            dialog.open = False
-            self.page.update()
+            self.page.pop_dialog()
 
         def save_tags(e):
             selected_ids = [cb.data for cb in checkboxes if cb.value]
@@ -980,9 +982,7 @@ class MoviePickerApp:
             bgcolor=COLORS["surface"],
         )
 
-        self.page.overlay.append(dialog)
-        dialog.open = True
-        self.page.update()
+        self.page.show_dialog(dialog)
 
     def _handle_similar_click(self, movie: Movie):
         """Handle find similar button click."""
@@ -1134,72 +1134,83 @@ class MoviePickerApp:
         if max_count == 0:
             max_count = 1
 
-        # Use expand weights instead of pixel heights — Flet distributes
-        # available vertical space automatically, so bars always fit.
-        # Animation: inner container slides up via offset inside a clipped outer.
+        # Pure proportional heights: bar height = count/max_count
+        # Label inside spacer, aligned to bottom — visually attached to bar top
         animated_bars = []
+        animated_labels = []
         bars = []
         for value in range(1, 11):
             count = counts[value]
 
-            # Spacer pushes bar down; bar fills proportional space
-            spacer = ft.Container(expand=max_count - count if count > 0 else max_count)
-
-            # Minimum expand so that small bars still have room for the label
-            bar_expand = max(count, 4) if count > 0 else 0
-
             if count > 0:
-                inner_bar = ft.Container(
+                count_label = ft.Text(
+                    str(count),
+                    size=13,
+                    color=RATING_COLORS[value],
+                    weight=ft.FontWeight.BOLD,
+                    text_align=ft.TextAlign.CENTER,
+                    opacity=0,
+                    animate_opacity=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
+                )
+                animated_labels.append(count_label)
+                # Spacer with label at bottom
+                spacer = ft.Container(
                     content=ft.Column(
-                        controls=[
-                            ft.Text(
-                                str(count),
-                                size=13,
-                                color=RATING_COLORS[value],
-                                weight=ft.FontWeight.BOLD,
-                                text_align=ft.TextAlign.CENTER,
-                            ),
-                            ft.Container(
-                                bgcolor=RATING_COLORS[value],
-                                border_radius=ft.border_radius.only(top_left=4, top_right=4),
-                                expand=True,
-                            ),
-                        ],
-                        spacing=4,
-                        expand=True,
-                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                        controls=[ft.Container(expand=1), count_label],
+                        spacing=0,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
+                    expand=max_count - count,
+                )
+                # Pure bar, no label inside
+                inner_bar = ft.Container(
+                    bgcolor=RATING_COLORS[value],
+                    border_radius=ft.border_radius.only(top_left=4, top_right=4),
                     expand=True,
                     offset=ft.Offset(0, 1),
                     animate_offset=ft.Animation(600, ft.AnimationCurve.EASE_OUT),
                 )
-                bar = ft.Container(
-                    expand=bar_expand,
+                bar_container = ft.Container(
+                    expand=count,
                     clip_behavior=ft.ClipBehavior.HARD_EDGE,
                     content=inner_bar,
                 )
                 animated_bars.append(inner_bar)
+                proportional_area = ft.Column(
+                    controls=[spacer, bar_container],
+                    spacing=4,
+                    expand=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                )
             else:
-                bar = ft.Container(
-                    height=3,
-                    bgcolor=RATING_COLORS[value],
-                    border_radius=ft.border_radius.only(top_left=4, top_right=4),
+                # Zero count: just a thin line at bottom
+                proportional_area = ft.Column(
+                    controls=[
+                        ft.Container(expand=1),
+                        ft.Container(
+                            height=3,
+                            bgcolor=RATING_COLORS[value],
+                            border_radius=ft.border_radius.only(top_left=4, top_right=4),
+                        ),
+                    ],
+                    spacing=0,
+                    expand=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 )
 
+            # Rating number at bottom
+            rating_label = ft.Text(
+                str(value),
+                size=14,
+                color=COLORS["text_primary"],
+                weight=ft.FontWeight.BOLD,
+                text_align=ft.TextAlign.CENTER,
+            )
+
             bar_col = ft.Column(
-                controls=[
-                    spacer,
-                    bar,
-                    ft.Text(
-                        str(value),
-                        size=14,
-                        color=COLORS["text_primary"],
-                        weight=ft.FontWeight.BOLD,
-                        text_align=ft.TextAlign.CENTER,
-                    ),
-                ],
+                controls=[proportional_area, rating_label],
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                spacing=2,
+                spacing=4,
                 expand=True,
             )
             bars.append(bar_col)
@@ -1243,16 +1254,25 @@ class MoviePickerApp:
         self.movie_list.set_custom_content(content)
         self.page.update()
 
-        # Trigger grow animation — slide bars and labels up
-        async def animate_bars():
+        # Trigger grow animation — slide bars up, then fade in labels
+        async def animate():
             await asyncio.sleep(0.15)
             if is_shutting_down():
                 return
+            # Start bars animation
             for ctrl in animated_bars:
                 ctrl.offset = ft.Offset(0, 0)
             self.page.update()
 
-        self.page.run_task(animate_bars)
+            # Wait until bars almost done (550ms), then fade in labels
+            await asyncio.sleep(0.55)
+            if is_shutting_down():
+                return
+            for label in animated_labels:
+                label.opacity = 1
+            self.page.update()
+
+        self.page.run_task(animate)
 
     def _show_loading(self):
         """Show loading indicator."""

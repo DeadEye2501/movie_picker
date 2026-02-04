@@ -168,6 +168,7 @@ class MovieCard(ft.Container):
                 height=180,
                 border_radius=8,
                 bgcolor=COLORS["surface_variant"],
+                margin=ft.margin.only(top=9),
             )
         else:
             return ft.Container(
@@ -177,6 +178,7 @@ class MovieCard(ft.Container):
                 bgcolor=COLORS["surface_variant"],
                 border_radius=8,
                 alignment=ft.Alignment(0, 0),
+                margin=ft.margin.only(top=9),
             )
 
     def _build_title_row(self) -> ft.Control:

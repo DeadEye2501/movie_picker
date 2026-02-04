@@ -12,6 +12,14 @@ class MovieList(ft.Container):
 
     ITEMS_PER_PAGE = 20  # Items to load per batch for infinite scroll
 
+    def is_isolated(self):
+        """Isolate this control to prevent updates from affecting siblings.
+
+        Disabled when showing custom content (stats) because expand doesn't work
+        properly in isolated controls.
+        """
+        return self._custom_content is None
+
     def __init__(
         self,
         on_rating_change: Optional[Callable[[Movie, int], None]] = None,

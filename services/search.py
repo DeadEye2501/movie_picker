@@ -5,7 +5,8 @@ from typing import Optional, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api import TMDBAPI, OMDBAPI, KinopoiskAPI, MDBListAPI
-from database import get_movie_by_kp_id, save_movie, search_local_movies, get_all_user_ratings
+from database import get_movie_by_kp_id, get_movies_by_kp_ids_batch, save_movie, search_local_movies_multi, get_all_user_ratings, get_session
+from database.db import save_movie_m2m
 from database.models import Movie
 from .recommender import RecommenderService
 
@@ -31,6 +32,18 @@ class SearchService:
         """Close the search service (clears any internal caches)."""
         self.recommender.clear_cache()
 
+    async def _save_m2m_background(self, pending_m2m: list[tuple]):
+        """Save directors/actors in background (doesn't block search results)."""
+        try:
+            async with get_session() as session:
+                for movie_id, directors, actors in pending_m2m:
+                    try:
+                        await save_movie_m2m(session, movie_id, directors, actors)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     async def search_movies(self, session: AsyncSession, query: str, page: int = 1, genres: list[int] = None, skip_ratings: bool = False, start_page: int = 1, num_pages: int = 3) -> list[Movie]:
         """Search for movies AND TV shows by keyword and/or genres."""
         query_words = [w.lower() for w in query.split() if w.strip()]
@@ -44,7 +57,7 @@ class SearchService:
         all_movies = []
         all_search_results = []
 
-        from database import get_rated_movies, get_cached_recommendations, save_cached_recommendations
+        from database import get_rated_movies, get_cached_recommendations_batch, save_cached_recommendations
 
         # 1. Get recommendations from user's rated movies (only on first page)
         if start_page > 1:
@@ -54,8 +67,13 @@ class SearchService:
         rated_movies = rated_movies[:10]
         uncached_rated = []
 
+        # Batch fetch all cached recommendations
+        cache_keys = [(m.kinopoisk_id, m.is_tv) for m in rated_movies]
+        cached_recs = await get_cached_recommendations_batch(session, cache_keys)
+
         for rated in rated_movies:
-            cached_ids = await get_cached_recommendations(session, rated.kinopoisk_id, rated.is_tv)
+            key = (rated.kinopoisk_id, rated.is_tv)
+            cached_ids = cached_recs.get(key)
             if cached_ids is not None:
                 for rec_id in cached_ids[:10]:
                     target_set = seen_tv_ids if rated.is_tv else seen_movie_ids
@@ -92,6 +110,7 @@ class SearchService:
         # 2. Parallel API calls for discover and search
         api_tasks = []
         task_info = []
+        keyword_results_count = 0  # Track keyword search results separately
 
         end_page = start_page + num_pages
         if genres:
@@ -104,16 +123,18 @@ class SearchService:
                     task_info.append(("discover_tv", tv_genres, pg))
 
         if query_words:
-            for word in query_words:
-                for pg in range(start_page, end_page):
-                    api_tasks.append(self.tmdb_api.search_by_keyword(word, pg))
-                    task_info.append(("search", word, pg))
+            # Search by full query first (fast for simple queries)
+            full_query = " ".join(query_words)
+            for pg in range(start_page, end_page):
+                api_tasks.append(self.tmdb_api.search_by_keyword(full_query, pg))
+                task_info.append(("search", full_query, pg))
 
         if api_tasks:
             results = await asyncio.gather(*api_tasks, return_exceptions=True)
             for info, result in zip(task_info, results):
                 if isinstance(result, Exception):
                     continue
+                is_keyword_search = info[0] == "search"
                 for item in result:
                     tmdb_id = item.get("kinopoisk_id")
                     is_tv = item.get("is_tv", False)
@@ -121,34 +142,48 @@ class SearchService:
                     if tmdb_id and tmdb_id not in target_set:
                         target_set.add(tmdb_id)
                         all_search_results.append(item)
+                        if is_keyword_search:
+                            keyword_results_count += 1
 
-        # 3. Search local database (only on first page)
-        if query_words and start_page == 1:
+        # Hybrid: if full phrase returned few results, also search by individual words
+        if query_words and len(query_words) > 1 and keyword_results_count < 20:
+            word_tasks = []
             for word in query_words:
-                local_movies = await search_local_movies(session, word)
-                for movie in local_movies:
-                    target_set = seen_tv_ids if movie.is_tv else seen_movie_ids
-                    if movie.kinopoisk_id not in target_set:
-                        target_set.add(movie.kinopoisk_id)
-                        all_movies.append(movie)
+                if len(word) >= 3:  # Skip short words
+                    for pg in range(start_page, min(start_page + 2, end_page)):  # Fewer pages per word
+                        word_tasks.append(self.tmdb_api.search_by_keyword(word, pg))
 
-        # 4. Load full info for API results
+            if word_tasks:
+                word_results = await asyncio.gather(*word_tasks, return_exceptions=True)
+                for result in word_results:
+                    if isinstance(result, Exception):
+                        continue
+                    for item in result:
+                        tmdb_id = item.get("kinopoisk_id")
+                        is_tv = item.get("is_tv", False)
+                        target_set = seen_tv_ids if is_tv else seen_movie_ids
+                        if tmdb_id and tmdb_id not in target_set:
+                            target_set.add(tmdb_id)
+                            all_search_results.append(item)
+
+        # 3. Load full info for API results (limit to avoid loading hundreds)
         if all_search_results:
-            api_movies = await self._load_movies_parallel(session, all_search_results, skip_ratings=skip_ratings)
+            # Limit to first 100 results - no point loading more than we'll show
+            limited_results = all_search_results[:100]
+            api_movies = await self._load_movies_parallel(session, limited_results, skip_ratings=skip_ratings)
             all_movies.extend(api_movies)
 
-        # 5. Filter by ALL query words
+        # 4. Filter by ALL query words
         if query_words:
             filtered_movies = [m for m in all_movies if self._matches_all_words(m, query_words)]
         else:
             filtered_movies = all_movies
 
-        # 6. Filter by selected genres
+        # 5. Filter by selected genres
         if genres:
             filtered_movies = [m for m in filtered_movies if self._matches_genres(m, genres)]
 
-        sorted_movies = await self._sort_by_user_preference(session, filtered_movies)
-        return sorted_movies
+        return await self._sort_by_user_preference(session, filtered_movies)
 
     def _map_movie_genres_to_tv(self, movie_genre_ids: list[int]) -> list[int]:
         """Map movie genre IDs to TV genre IDs."""
@@ -166,13 +201,25 @@ class SearchService:
         movies = []
         to_load = []
 
+        # Collect all IDs first
+        all_ids = []
+        for result in search_results:
+            kp_id = result.get("kinopoisk_id")
+            is_tv = result.get("is_tv", False)
+            if kp_id:
+                all_ids.append((kp_id, is_tv))
+
+        # Batch query to check which movies are already cached
+        cached_movies = await get_movies_by_kp_ids_batch(session, all_ids)
+
+        # Separate cached from uncached
         for result in search_results:
             kp_id = result.get("kinopoisk_id")
             is_tv = result.get("is_tv", False)
             if not kp_id:
                 continue
 
-            existing_movie = await get_movie_by_kp_id(session, kp_id, is_tv)
+            existing_movie = cached_movies.get((kp_id, is_tv))
             if existing_movie and existing_movie.director_list:
                 movies.append(existing_movie)
             else:
@@ -182,14 +229,37 @@ class SearchService:
             tasks = [self._load_single_item(kp_id, is_tv, skip_ratings) for kp_id, is_tv in to_load]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
+            saved_movies = []
+            pending_m2m = []  # (movie_id, directors, actors) for background save
+
             for result in results:
                 if isinstance(result, Exception) or result is None:
                     continue
                 try:
-                    movie = await save_movie(session, result)
-                    movies.append(movie)
+                    # Extract M2M data before save (save_movie pops them)
+                    directors = result.get("directors")
+                    actors = result.get("actors")
+
+                    # Fast save without directors/actors
+                    movie = await save_movie(session, result.copy(), auto_commit=False, skip_m2m=True)
+                    saved_movies.append(movie)
+
+                    # Queue M2M for background processing
+                    if directors or actors:
+                        pending_m2m.append((movie.id, directors, actors))
                 except Exception:
                     pass
+
+            # Single commit for all movies
+            if saved_movies:
+                await session.commit()
+                for movie in saved_movies:
+                    await session.refresh(movie, ["genre_list", "director_list", "actor_list"])
+                movies.extend(saved_movies)
+
+            # Schedule background M2M save
+            if pending_m2m:
+                asyncio.create_task(self._save_m2m_background(pending_m2m))
 
         return movies
 
@@ -233,7 +303,20 @@ class SearchService:
                     if not isinstance(result, Exception) and result is not None:
                         kp_results[m["kinopoisk_id"]] = result
 
-        # 4. Now update the database - quick operations
+        # 4. Batch fetch all movies that need updates
+        keys_to_update = [
+            (m["kinopoisk_id"], m["is_tv"])
+            for m in movies_info
+            if external_results.get(m["kinopoisk_id"]) or kp_results.get(m["kinopoisk_id"]) is not None
+        ]
+
+        if not keys_to_update:
+            return
+
+        movies_map = await get_movies_by_kp_ids_batch(session, keys_to_update)
+
+        # 5. Update all movies and commit once
+        updated_movies = []
         for m_info in movies_info:
             kp_id = m_info["kinopoisk_id"]
             ext_data = external_results.get(kp_id, {})
@@ -242,8 +325,7 @@ class SearchService:
             if not ext_data and kp_data is None:
                 continue
 
-            # Re-fetch movie in current session for update
-            movie = await get_movie_by_kp_id(session, kp_id, m_info["is_tv"])
+            movie = movies_map.get((kp_id, m_info["is_tv"]))
             if not movie:
                 continue
 
@@ -262,8 +344,12 @@ class SearchService:
                 updated = True
 
             if updated:
-                await session.commit()
-                if on_movie_updated:
+                updated_movies.append(movie)
+
+        if updated_movies:
+            await session.commit()
+            if on_movie_updated:
+                for movie in updated_movies:
                     on_movie_updated(movie)
 
     async def _fetch_external_ratings_by_info(self, movie_info: dict) -> dict:
@@ -460,9 +546,12 @@ class SearchService:
         if not await self.recommender.has_user_ratings(session, cached_ratings):
             return sorted(movies, key=lambda m: m.tmdb_rating or 0, reverse=True)
 
+        # Pre-load all recommendations ONCE (avoids N*M DB queries)
+        preloaded_recs = await self.recommender.preload_recommendations(session, cached_ratings)
+
         scored_movies = []
         for movie in movies:
-            score = await self.recommender.calculate_score(movie, session, cached_ratings)
+            score = await self.recommender.calculate_score(movie, session, cached_ratings, preloaded_recs)
             scored_movies.append((movie, score))
 
         scored_movies.sort(key=lambda x: x[1], reverse=True)
@@ -470,7 +559,7 @@ class SearchService:
 
     async def find_magic_recommendation(self, session: AsyncSession) -> Optional[Movie]:
         """Find the single best unwatched movie based on user's preferences."""
-        from database import get_rated_movies, get_cached_recommendations, save_cached_recommendations, get_wishlist_movie_ids
+        from database import get_rated_movies, get_cached_recommendations_batch, save_cached_recommendations, get_wishlist_movie_ids
 
         rated_movies = await get_rated_movies(session, min_rating=6)
         if not rated_movies:
@@ -479,7 +568,7 @@ class SearchService:
         # Pre-load all user ratings ONCE (used for filtering and scoring)
         cached_ratings = await get_all_user_ratings(session)
         rated_ids = {(ur.movie.kinopoisk_id, ur.movie.is_tv) for ur in cached_ratings}
-        
+
         # Get wishlist movie IDs to exclude them from recommendations
         wishlist_ids = await get_wishlist_movie_ids(session)
 
@@ -487,13 +576,19 @@ class SearchService:
         candidates = []
         uncached = []
 
-        for rated in rated_movies[:20]:
-            cached_ids = await get_cached_recommendations(session, rated.kinopoisk_id, rated.is_tv)
+        # Batch fetch all cached recommendations
+        top_rated = rated_movies[:20]
+        cache_keys = [(m.kinopoisk_id, m.is_tv) for m in top_rated]
+        cached_recs = await get_cached_recommendations_batch(session, cache_keys)
+
+        for rated in top_rated:
+            key = (rated.kinopoisk_id, rated.is_tv)
+            cached_ids = cached_recs.get(key)
             if cached_ids is not None:
                 for rec_id in cached_ids:
-                    key = (rec_id, rated.is_tv)
-                    if key not in rated_ids and key not in seen_ids:
-                        seen_ids.add(key)
+                    rec_key = (rec_id, rated.is_tv)
+                    if rec_key not in rated_ids and rec_key not in seen_ids:
+                        seen_ids.add(rec_key)
                         candidates.append({"kinopoisk_id": rec_id, "is_tv": rated.is_tv})
             else:
                 uncached.append(rated)
@@ -529,6 +624,9 @@ class SearchService:
         if not movies:
             return None
 
+        # Pre-load all recommendations ONCE
+        preloaded_recs = await self.recommender.preload_recommendations(session, cached_ratings)
+
         best_movie = None
         best_score = float('-inf')
 
@@ -538,7 +636,7 @@ class SearchService:
             # Skip movies that are in wishlist
             if movie.id in wishlist_ids:
                 continue
-            score = await self.recommender.calculate_score(movie, session, cached_ratings)
+            score = await self.recommender.calculate_score(movie, session, cached_ratings, preloaded_recs)
             if score > best_score:
                 best_score = score
                 best_movie = movie

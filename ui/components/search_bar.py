@@ -203,16 +203,14 @@ class SearchBar(ft.Container):
             )
             checkboxes.append(cb)
 
-        def close_dialog(e):
-            dialog.open = False
-            self.page.update()
+        def close_dialog(e=None):
+            self.page.pop_dialog()
 
         def apply_selection(e):
             self.selected_genres = [cb.data for cb in checkboxes if cb.value]
             self._update_selected_genres_text()
             self.genre_button.icon_color = COLORS["primary"] if self.selected_genres else COLORS["text_primary"]
-            dialog.open = False
-            self.page.update()
+            close_dialog()
             if self.on_genre_change:
                 self.on_genre_change()
 
@@ -222,8 +220,7 @@ class SearchBar(ft.Container):
             self.selected_genres = []
             self._update_selected_genres_text()
             self.genre_button.icon_color = COLORS["text_primary"]
-            dialog.open = False
-            self.page.update()
+            close_dialog()
             if self.on_genre_change:
                 self.on_genre_change()
 
@@ -252,9 +249,7 @@ class SearchBar(ft.Container):
             bgcolor=COLORS["surface"],
         )
 
-        self.page.overlay.append(dialog)
-        dialog.open = True
-        self.page.update()
+        self.page.show_dialog(dialog)
 
     def _handle_manage_tags(self):
         """Open tag management dialog."""

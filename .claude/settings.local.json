@@ -16,7 +16,8 @@
       "WebFetch(domain:mdblist.docs.apiary.io)",
       "WebFetch(domain:docs.mdblist.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(pipenv run:*)"
+      "Bash(pipenv run:*)",
+      "Bash(findstr:*)"
     ]
   }
 }

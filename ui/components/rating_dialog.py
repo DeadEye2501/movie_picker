@@ -29,8 +29,7 @@ def show_rating_dialog(
     )
 
     def close_dialog(e=None):
-        dialog.open = False
-        page.update()
+        page.pop_dialog()
 
     def save_and_close(e):
         if on_save:
@@ -66,9 +65,7 @@ def show_rating_dialog(
         bgcolor=COLORS["surface"],
     )
 
-    page.overlay.append(dialog)
-    dialog.open = True
-    page.update()
+    page.show_dialog(dialog)
 
 
 # Keep class for backwards compatibility

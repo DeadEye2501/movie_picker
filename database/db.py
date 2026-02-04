@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, AsyncGenerator
 from datetime import timedelta, timezone
 
-from sqlalchemy import func, or_, select, delete
+from sqlalchemy import func, or_, select, delete, union
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -132,7 +132,35 @@ async def get_movie_by_kp_id(session: AsyncSession, kinopoisk_id: int, is_tv: bo
     return result.scalar_one_or_none()
 
 
-async def save_movie(session: AsyncSession, movie_data: dict) -> Movie:
+async def get_movies_by_kp_ids_batch(session: AsyncSession, kp_ids_with_type: list[tuple[int, bool]]) -> dict[tuple[int, bool], Movie]:
+    """Get multiple movies/TV shows by their TMDB IDs in a single query.
+
+    Args:
+        kp_ids_with_type: List of (kinopoisk_id, is_tv) tuples
+
+    Returns:
+        Dict mapping (kinopoisk_id, is_tv) -> Movie
+    """
+    if not kp_ids_with_type:
+        return {}
+
+    # Build OR conditions for each (id, is_tv) pair
+    conditions = [
+        (Movie.kinopoisk_id == kp_id) & (Movie.is_tv == is_tv)
+        for kp_id, is_tv in kp_ids_with_type
+    ]
+
+    result = await session.execute(
+        select(Movie)
+        .options(selectinload(Movie.genre_list), selectinload(Movie.director_list), selectinload(Movie.actor_list))
+        .filter(or_(*conditions))
+    )
+
+    movies = result.unique().scalars().all()
+    return {(m.kinopoisk_id, m.is_tv): m for m in movies}
+
+
+async def save_movie(session: AsyncSession, movie_data: dict, auto_commit: bool = True, skip_m2m: bool = False) -> Movie:
     """Save or update a movie/TV show in the database.
 
     Handles M2M relationships for genres, directors, and actors.
@@ -140,6 +168,10 @@ async def save_movie(session: AsyncSession, movie_data: dict) -> Movie:
         - genres: comma-separated string "драма, комедия"
         - directors: list of dicts [{"tmdb_id": 123, "name": "Name"}, ...]
         - actors: list of dicts [{"tmdb_id": 456, "name": "Name"}, ...]
+
+    Args:
+        auto_commit: If False, caller is responsible for commit (for batch operations)
+        skip_m2m: If True, skip saving directors/actors (for fast initial save)
     """
     is_tv = movie_data.get("is_tv", False)
     kinopoisk_id = movie_data["kinopoisk_id"]
@@ -160,23 +192,45 @@ async def save_movie(session: AsyncSession, movie_data: dict) -> Movie:
                 if hasattr(movie, key) and key != "id":
                     setattr(movie, key, value)
 
-        # Set M2M relationships
+        # Set M2M relationships (genres are fast, directors/actors are slow)
         if genres_string is not None:
             await set_movie_genres(session, movie, genres_string)
-        if directors_list is not None:
-            await set_movie_directors(session, movie, directors_list)
-        if actors_list is not None:
-            await set_movie_actors(session, movie, actors_list)
 
-        await session.commit()
-        await session.refresh(movie, ["genre_list", "director_list", "actor_list"])
+        if not skip_m2m:
+            if directors_list is not None:
+                await set_movie_directors(session, movie, directors_list)
+            if actors_list is not None:
+                await set_movie_actors(session, movie, actors_list)
+
+        if auto_commit:
+            await session.commit()
+            await session.refresh(movie, ["genre_list", "director_list", "actor_list"])
     except Exception:
         await session.rollback()
         movie = await get_movie_by_kp_id(session, kinopoisk_id, is_tv)
         if movie is None:
             raise
 
+    # Store M2M data for later background processing
+    if skip_m2m and (directors_list or actors_list):
+        movie._pending_directors = directors_list
+        movie._pending_actors = actors_list
+
     return movie
+
+
+async def save_movie_m2m(session: AsyncSession, movie_id: int, directors: list[dict] = None, actors: list[dict] = None):
+    """Save only M2M relationships for a movie (for background processing)."""
+    movie = await session.get(Movie, movie_id)
+    if not movie:
+        return
+
+    if directors is not None:
+        await set_movie_directors(session, movie, directors)
+    if actors is not None:
+        await set_movie_actors(session, movie, actors)
+
+    await session.commit()
 
 
 # =============================================================================
@@ -477,44 +531,54 @@ async def update_entity_ratings(session: AsyncSession, movie: Movie):
 
 async def search_local_movies(session: AsyncSession, query: str) -> list[Movie]:
     """Search movies in local database using a single optimized query."""
-    search_term = f"%{query.lower()}%"
+    return await search_local_movies_multi(session, [query])
 
-    # Use subqueries to find matching movie IDs from all sources
-    # Then load movies with all relationships in a single query
 
-    # Subquery for movies matching by fields
-    fields_subq = (
-        select(Movie.id)
-        .filter(or_(
-            func.lower(Movie.title).like(search_term),
-            func.lower(Movie.title_original).like(search_term),
-            func.lower(Movie.description).like(search_term),
-        ))
-    )
+async def search_local_movies_multi(session: AsyncSession, queries: list[str]) -> list[Movie]:
+    """Search movies in local database for multiple query words in a single query."""
+    if not queries:
+        return []
 
-    # Subquery for movies matching by genre
-    genre_subq = (
-        select(Movie.id)
-        .join(MovieGenre).join(Genre)
-        .filter(func.lower(Genre.name).like(search_term))
-    )
+    all_subqueries = []
 
-    # Subquery for movies matching by director
-    director_subq = (
-        select(Movie.id)
-        .join(MovieDirector).join(Director)
-        .filter(func.lower(Director.name).like(search_term))
-    )
+    for query in queries:
+        search_term = f"%{query.lower()}%"
 
-    # Subquery for movies matching by actor
-    actor_subq = (
-        select(Movie.id)
-        .join(MovieActor).join(Actor)
-        .filter(func.lower(Actor.name).like(search_term))
-    )
+        # Subquery for movies matching by fields
+        fields_subq = (
+            select(Movie.id)
+            .filter(or_(
+                func.lower(Movie.title).like(search_term),
+                func.lower(Movie.title_original).like(search_term),
+                func.lower(Movie.description).like(search_term),
+            ))
+        )
+
+        # Subquery for movies matching by genre
+        genre_subq = (
+            select(Movie.id)
+            .join(MovieGenre).join(Genre)
+            .filter(func.lower(Genre.name).like(search_term))
+        )
+
+        # Subquery for movies matching by director
+        director_subq = (
+            select(Movie.id)
+            .join(MovieDirector).join(Director)
+            .filter(func.lower(Director.name).like(search_term))
+        )
+
+        # Subquery for movies matching by actor
+        actor_subq = (
+            select(Movie.id)
+            .join(MovieActor).join(Actor)
+            .filter(func.lower(Actor.name).like(search_term))
+        )
+
+        all_subqueries.extend([fields_subq, genre_subq, director_subq, actor_subq])
 
     # Combine all matching IDs with UNION and fetch movies with relationships
-    combined_ids = fields_subq.union(genre_subq, director_subq, actor_subq).subquery()
+    combined_ids = union(*all_subqueries).subquery()
 
     result = await session.execute(
         select(Movie)
@@ -547,6 +611,51 @@ async def get_cached_recommendations(session: AsyncSession, tmdb_id: int, is_tv:
     if cache.recommended_ids:
         return json.loads(cache.recommended_ids)
     return []
+
+
+async def get_cached_recommendations_batch(
+    session: AsyncSession,
+    keys: list[tuple[int, bool]],
+    max_age_days: int = 7
+) -> dict[tuple[int, bool], list[int]]:
+    """Get cached TMDB recommendations for multiple movies in a single query.
+
+    Args:
+        keys: List of (tmdb_id, is_tv) tuples
+
+    Returns:
+        Dict mapping (tmdb_id, is_tv) -> list of recommended IDs.
+        Missing or expired entries are not included.
+    """
+    if not keys:
+        return {}
+
+    # Build OR conditions
+    conditions = [
+        (RecommendationCache.source_tmdb_id == tmdb_id) & (RecommendationCache.source_is_tv == is_tv)
+        for tmdb_id, is_tv in keys
+    ]
+
+    result = await session.execute(
+        select(RecommendationCache).filter(or_(*conditions))
+    )
+    caches = result.scalars().all()
+
+    now = utc_now()
+    max_age = timedelta(days=max_age_days)
+    output = {}
+
+    for cache in caches:
+        cache_updated = cache.updated_at.replace(tzinfo=timezone.utc) if cache.updated_at.tzinfo is None else cache.updated_at
+        if now - cache_updated > max_age:
+            continue
+        key = (cache.source_tmdb_id, cache.source_is_tv)
+        if cache.recommended_ids:
+            output[key] = json.loads(cache.recommended_ids)
+        else:
+            output[key] = []
+
+    return output
 
 
 async def save_cached_recommendations(session: AsyncSession, tmdb_id: int, is_tv: bool, recommended_ids: list[int]):
